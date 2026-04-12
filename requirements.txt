@@ -2,18 +2,4 @@ vkbottle
 aiohttp
 python-dotenv
 requests
-<parameter name="task_progress">- [x] Прочитать и проанализировать tb.md
-- [x] Создать tbank.py с кодом из tb.md
-- [x] Проверить requirements.txt на requests
-- [x] Добавить requests в requirements.txt
-- [ ] Добавить в Config ключи TBANK_*
-- [ ] Импортировать TBankAPI в vk_bot.py
-- [ ] Добавить self.tbank в BananaBoomBot
-- [ ] Добавить UserState.TOPUP_WAITING_AMOUNT
-- [ ] Изменить top_up_handler на запрос суммы
-- [ ] Добавить handler для суммы: генерировать платеж
-- [ ] Добавить таблицу payments в DB
-- [ ] Добавить /tbank_notify в webhook_handler
-- [ ] Отформатировать код
-- [ ] pip install -r requirements.txt
-- [ ] Перезапустить бота
+pydantic

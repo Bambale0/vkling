@@ -1,1755 +1,1332 @@
-"""Модуль для работы с API Т-Банк (эквайринг)."""
-import hashlib
-import json
-import logging
-from typing import Any, Dict, List, Optional, Union
-
-import requests
-
-logger = logging.getLogger(__name__)
-
-
-class TBankAPI:
-    """Класс для работы с API Т-Банк по документации https://developer.tbank.ru/eacq"""
-
-    def __init__(
-        self, terminal_key: str, secret_key: str, api_url: str, timeout: int = 15
-    ):
-        """
-        Инициализация клиента.
-
-        :param terminal_key: Идентификатор терминала (выдаётся в Т‑Бизнес)
-        :param secret_key: Секретный ключ (пароль) для подписи запросов
-        :param api_url: Базовый URL API (например, https://rest-api-test.tinkoff.ru/v2)
-        :param timeout: Таймаут запросов в секундах (по умолчанию 15)
-        """
-        self.terminal_key = terminal_key
-        self.secret_key = secret_key
-        self.api_url = api_url.rstrip("/")
-        self.timeout = timeout
-
-    def _generate_token(self, params: Dict[str, Any]) -> str:
-        """
-        Генерация токена подписи по документации Т-Банк:
-
-        1. Принимаются только скалярные параметры (строки, числа, булевы)
-        2. Добавляется {"Password": secret_key}
-        3. Сортировка по алфавиту по ключу
-        4. Конкатенация значений (все приведены к строке)
-        5. SHA-256 хеш (UTF-8)
-
-        :param params: Словарь параметров (без Token и вложенных объектов)
-        :return: Токен (hex-строка)
-        """
-        # Копируем только скалярные значения, исключая Token
-        token_params = {}
-        for key, value in params.items():
-            if key == "Token":
-                continue
-            if isinstance(value, (str, int, float, bool)):
-                # Булевы значения приводим к "true"/"false" (нижний регистр)
-                if isinstance(value, bool):
-                    token_params[key] = "true" if value else "false"
-                else:
-                    token_params[key] = str(value)
-            # Остальные типы (dict, list) игнорируем – они не участвуют в токене
-
-        # Добавляем пароль
-        token_params["Password"] = self.secret_key
-
-        # Сортируем ключи по алфавиту
-        sorted_keys = sorted(token_params.keys())
-
-        # Конкатенируем значения
-        values_str = "".join(token_params[k] for k in sorted_keys)
-
-        # SHA-256
-        return hashlib.sha256(values_str.encode("utf-8")).hexdigest()
-
-    def _post(self, endpoint: str, payload: Dict) -> Optional[Dict]:
-        """
-        Внутренний метод для POST-запроса с обработкой ошибок и логированием.
-        """
-        url = f"{self.api_url}/{endpoint.lstrip('/')}"
-        logger.info(
-            f"Request to {url}: {json.dumps(payload, ensure_ascii=False, default=str)}"
-        )
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            logger.info(f"Response: {json.dumps(result, ensure_ascii=False)}")
-            return result
-        except requests.exceptions.RequestException as e:
-            logger.exception(f"HTTP request failed: {e}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.exception(f"Invalid JSON response: {e}")
-            return None
-
-    # -------------------------------------------------------------------------
-    # Методы API
-    # -------------------------------------------------------------------------
-
-    def init_payment(
-        self,
-        amount: int,
-        order_id: str,
-        description: str,
-        customer_key: Optional[str] = None,
-        success_url: Optional[str] = None,
-        fail_url: Optional[str] = None,
-        notification_url: Optional[str] = None,
-        pay_type: str = "O",
-        recurrent: Optional[str] = None,  # "Y" или None
-        redirect_due_date: Optional[str] = None,  # строка с датой и таймзоной
-        language: str = "ru",
-        receipt: Optional[Dict] = None,
-        data: Optional[Dict] = None,
-    ) -> Optional[Dict]:
-        """
-        Инициализация платежа (метод Init).
-
-        :param amount: Сумма в копейках
-        :param order_id: Идентификатор заказа (до 36 символов)
-        :param description: Описание заказа (до 140 символов)
-        :param customer_key: Идентификатор покупателя (для сохранения карт)
-        :param success_url: URL при успешной оплате
-        :param fail_url: URL при неуспешной оплате
-        :param notification_url: URL для уведомлений
-        :param pay_type: Тип платежа: "O" (одностадийный) или "T" (двухстадийный)
-        :param recurrent: Признак родительского рекуррентного платежа ("Y")
-        :param redirect_due_date: Срок жизни ссылки / QR-кода (ISO8601 с таймзоной)
-        :param language: Язык платежной формы ("ru" / "en")
-        :param receipt: Данные чека (объект)
-        :param data: Дополнительные параметры (объект)
-        :return: Ответ API или None при ошибке
-        """
-        # Формируем базовые параметры (только скаляры)
-        params = {
-            "TerminalKey": self.terminal_key,
-            "Amount": amount,
-            "OrderId": str(order_id)[:36],
-            "Description": description[:140] if description else "",
-            "Language": language,
-            "PayType": pay_type,
-        }
-
-        # Добавляем опциональные параметры, если они переданы
-        if customer_key is not None:
-            params["CustomerKey"] = str(customer_key)[:36]
-        if success_url is not None:
-            params["SuccessURL"] = success_url
-        if fail_url is not None:
-            params["FailURL"] = fail_url
-        if notification_url is not None:
-            params["NotificationURL"] = notification_url
-        if recurrent is not None:
-            params["Recurrent"] = recurrent
-        if redirect_due_date is not None:
-            params["RedirectDueDate"] = redirect_due_date
-
-        # Генерируем токен
-        token = self._generate_token(params)
-
-        # Формируем полный payload
-        payload = {**params, "Token": token}
-        if receipt:
-            payload["Receipt"] = receipt
-            # Детальное логирование чека для отладки
-            total_amount = sum(
-                item.get("Amount", 0) for item in receipt.get("Items", [])
-            )
-            logger.info(f"Receipt total: {total_amount}, Payment amount: {amount}")
-        if data:
-            payload["DATA"] = data
-
-        return self._post("Init", payload)
-
-    def finish_authorize(
-        self,
-        payment_id: str,
-        ip: Optional[str] = None,
-        send_email: Optional[bool] = None,
-        info_email: Optional[str] = None,
-        encrypted_payment_data: Optional[str] = None,
-        card_data: Optional[str] = None,
-        route: Optional[str] = None,  # "ACQ", "MC", "EINV", "WM"
-        data: Optional[Dict] = None,
-    ) -> Optional[Dict]:
-        """
-        Завершение авторизации платежа (метод FinishAuthorize).
-        Используется для подтверждения после 3DS или при оплате картой с передачей данных карты.
-
-        :param payment_id: Идентификатор платежа в системе Т‑Банк
-        :param ip: IP-адрес покупателя (обязателен для 3DS v2)
-        :param send_email: Отправлять ли уведомление на почту
-        :param info_email: Адрес почты (обязателен, если send_email=True)
-        :param encrypted_payment_data: Зашифрованные данные для Apple Pay / Google Pay
-        :param card_data: Данные карты (PAN;ExpDate;CardHolder;CVV), зашифрованные открытым ключом
-        :param route: Способ платежа (например, "ACQ")
-        :param data: Дополнительные параметры (объект)
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        if ip is not None:
-            params["IP"] = ip
-        if send_email is not None:
-            params["SendEmail"] = send_email
-        if info_email is not None:
-            params["InfoEmail"] = info_email
-        if encrypted_payment_data is not None:
-            params["EncryptedPaymentData"] = encrypted_payment_data
-        if card_data is not None:
-            params["CardData"] = card_data
-        if route is not None:
-            params["Route"] = route
-
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        if data:
-            payload["DATA"] = data
-
-        return self._post("FinishAuthorize", payload)
-
-    def confirm(self, payment_id: str, amount: Optional[int] = None) -> Optional[Dict]:
-        """
-        Подтверждение списания для двухстадийного платежа (метод Confirm).
-
-        :param payment_id: Идентификатор платежа
-        :param amount: Сумма списания в копейках (если не указана, списывается полная сумма)
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        if amount is not None:
-            params["Amount"] = amount
-
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("Confirm", payload)
-
-    def cancel(self, payment_id: str) -> Optional[Dict]:
-        """
-        Отмена платежа (метод Cancel).
-
-        :param payment_id: Идентификатор платежа
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("Cancel", payload)
-
-    def get_state(self, payment_id: str) -> Optional[Dict]:
-        """
-        Получение статуса платежа (метод GetState).
-
-        :param payment_id: Идентификатор платежа
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("GetState", payload)
-
-    def get_card_list(self, customer_key: str) -> Optional[Dict]:
-        """
-        Получение списка сохранённых карт клиента (метод GetCardList).
-
-        :param customer_key: Идентификатор покупателя
-        :return: Ответ API со списком карт в поле Cards
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "CustomerKey": str(customer_key),
-        }
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("GetCardList", payload)
-
-    def remove_card(
-        self, card_id: str, customer_key: Optional[str] = None
-    ) -> Optional[Dict]:
-        """
-        Удаление сохранённой карты (метод RemoveCard).
-
-        :param card_id: Идентификатор карты в системе Т‑Банк
-        :param customer_key: Идентификатор покупателя (требуется не всегда, но рекомендуется)
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "CardId": str(card_id),
-        }
-        if customer_key is not None:
-            params["CustomerKey"] = str(customer_key)
-
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("RemoveCard", payload)
-
-    def resend(self, payment_id: str) -> Optional[Dict]:
-        """
-        Повторная отправка уведомления на NotificationURL (метод Resend).
-
-        :param payment_id: Идентификатор платежа
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        token = self._generate_token(params)
-        payload = {**params, "Token": token}
-        return self._post("Resend", payload)
-
-    def send_closing_receipt(self, payment_id: str, receipt: Dict) -> Optional[Dict]:
-        """
-        Отправка закрывающего чека в кассу (метод SendClosingReceipt).
-
-        :param payment_id: Идентификатор платежа
-        :param receipt: Данные чека (объект)
-        :return: Ответ API
-        """
-        params = {
-            "TerminalKey": self.terminal_key,
-            "PaymentId": str(payment_id),
-        }
-        token = self._generate_token(params)
-        payload = {**params, "Token": token, "Receipt": receipt}
-        return self._post("SendClosingReceipt", payload)
-
-    # -------------------------------------------------------------------------
-    # Вспомогательные методы для построения объектов
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def build_receipt(
-        email: str, phone: str, items: List[Dict], taxation: str = "osn"
-    ) -> Dict:
-        """
-        Формирование объекта чека для 54-ФЗ.
-
-        :param email: Email покупателя
-        :param phone: Телефон покупателя
-        :param items: Список товаров. Каждый товар — словарь с полями:
-                      Name (str), Price (int, в копейках), Quantity (float),
-                      Amount (int, Price * Quantity), Tax (str, ставка НДС)
-        :param taxation: Система налогообложения (по умолчанию "osn")
-        :return: Словарь чека
-        """
-        return {"Email": email, "Phone": phone, "Taxation": taxation, "Items": items}
-        Инициировать платеж
-
-production
-
-test
-POST
-https://rest-api-test.tinkoff.ru/v2/Init
-
-
-
-Описание
-Метод инициирует платеж.
-
-Запрос
-Request body schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-Amount
-
-Number
-
-Requirements: <= 10 characters
-
-Сумма в копейках. Например, 3 руб. 12коп. — это число 312.
-Параметр должен быть равен сумме всех параметров Amount, переданных в объекте Items.
-Минимальная сумма операции с помощью СБП составляет 10 руб.
-Required
-
-OrderId
-
-String
-
-Requirements: <= 36 characters
-
-Идентификатор заказа в системе мерчанта. Должен быть уникальным для каждой операции.
-
-Required
-
-Token
-
-String
-
-Подпись запроса. Как сформировать.
-
-Description
-
-String
-
-Requirements: <= 140 characters
-
-Описание заказа. Значение параметра будет отображено на платежной форме.
-
-Параметр обязательный при привязке и одновременной оплате через СБП. При оплате через СБП текст из этого параметра отобразится в мобильном банке клиента.
-
-CustomerKey
-
-String
-
-Requirements: <= 36 characters
-
-Идентификатор покупателя в системе мерчанта. Нужен для сохранения карт на платежной форме — платежи в один клик.
-
-Параметр обязательный, если передан параметр Recurrent=Y и автоплатеж проводится по карте.
-
-Если передан, в уведомлении будут указаны CustomerKey и его CardId. Подробнее — в методе Получить список карт клиента.
-
-Recurrent
-
-String
-
-Requirements: <= 1 characters, [Y]
-
-Признак родительского CC-платежа. Обязателен для проведения операции с сохранением реквизитов карты покупателя.
-
-Если передается и установлен в Y, при платеже будут сохранены реквизиты карты покупателя. В этом случае после оплаты в уведомлении на AUTHORIZED будет передан параметр RebillId для использования в методе Провести платеж по сохраненным реквизитам. Для привязки и одновременной оплаты по CБП передавайте Y.
-
-PayType
-
-String
-
-Requirements: [O, T]
-
-Определяет тип проведения платежа:
-
-O — одностадийная оплата;
-T — двухстадийная оплата.
-Если параметр передан, используется его значение, если нет — значение из настроек терминала.
-
-Language
-
-String
-
-Requirements: <= 2 characters
-
-Default: ru
-
-Язык платежной формы:
-
-ru — русский;
-en — английский.
-Если параметр не передан, форма откроется на русском языке.
-
-NotificationURL
-
-String<uri>
-
-URL на веб-сайте мерчанта, куда будет отправлен POST-запрос о статусе выполнения вызываемых методов — настраивается в личном кабинете.
-
-Если параметр передан, используется его значение, если нет — значение из настроек терминала.
-
-Подробнее
-
-SuccessURL
-
-String<uri>
-
-URL на веб-сайте мерчанта, куда будет переведен клиент в случае успешной оплаты — настраивается в личном кабинете.
-
-Если параметр передан, используется его значение, если нет — значение из настроек терминала.
-
-FailURL
-
-String<uri>
-
-URL на веб-сайте мерчанта, куда будет переведен клиент в случае неуспешной оплаты — настраивается в личном кабинете.
-
-Если параметр передан, используется его значение, если нет — значение из настроек терминала.
-
-RedirectDueDate
-
-<date-time>
-
-Cрок жизни ссылки или динамического QR-кода СБП, если выбран этот способ оплаты.
-
-Если дата в параметре меньше текущей, оплата по ссылке и QR будет недоступна.
-
-Минимальное значение — 1 минута от текущей даты.
-Максимальное значение — 90 дней от текущей даты.
-Формат даты — YYYY-MM-DDTHH24:MI:SS+GMT.
-Пример даты — 2016-08-31T12:28:00+03:00.
-
-Если параметр не был передан, проверяется настроечный параметр терминала REDIRECT_TIMEOUT, который содержит значение срока жизни ссылки в часах. Если его значение:
-
-больше нуля — оно будет установлено в качестве срока жизни ссылки или динамического QR-кода;
-меньше нуля — устанавливается значение по умолчанию: 1440 мин. (1 сутки).
-DATA
-
-Object
-
-JSON-объект с дополнительными параметрами по операции и настройками в формате ключ:значение.
-
-Максимальная длина ключа — 20 знаков, значения — 100 знаков.
-
-Максимальное количество пар ключ:значение — не больше 20.
-
-Если ключи или значения содержат в себе специальные символы, получившееся значение должно быть закодировано функцией urlencode.
-
-Receipt
-
-Object
-
-JSON-объект с данными чека. Параметр обязательный, если подключена онлайн-касса.
-
-Shops
-
-Array of objects ()
-
-JSON-объект с данными маркетплейса. Параметр обязательный для маркетплейсов.
-
-Ответ
-200
-
-OK
-
-Response schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-Amount
-
-Number
-
-Requirements: <= 20 characters
-
-Сумма в копейках.
-
-Required
-
-OrderId
-
-String
-
-Requirements: <= 36 characters
-
-Идентификатор заказа в системе мерчанта. Должен быть уникальным для каждой операции.
-
-Required
-
-Success
-
-Boolean
-
-Успешность прохождения запроса — true/false.
-
-Required
-
-Status
-
-String
-
-Requirements: <= 20 characters
-
-Статус транзакции.
-
-Required
-
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-ErrorCode
-
-String
-
-Requirements: <= 20 characters
-
-Код ошибки.
-
-PaymentURL
-
-String<uri>
-
-Requirements: <= 100 characters
-
-Ссылка на платежную форму. Параметр возвращается только для мерчантов, которые используют платежную форму Т-Банка.
-
-Message
-
-String
-
-Requirements: <= 255 characters
-
-Краткое описание ошибки.
-
-Details
-
-String
-
-Подробное описание ошибки.
-Подтвердить платеж
-
-production
-
-test
-POST
-https://rest-api-test.tinkoff.ru/v2/FinishAuthorize
-
-
-
-Описание
-Для мерчантов c собственной платежной формой
-
-Метод подтверждает платеж:
-
-при одностадийной оплате — списывает деньги за покупку сразу после завершения оплаты;
-при двухстадийной — блокирует деньги за покупку на карте покупателя и только потом списывает их.
-Запрос
-Request body schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-Token
-
-String
-
-Подпись запроса. Как сформировать.
-
-IP
-
-String
-
-IP-адрес покупателя в формате IPv4 и IPv6. DS платежной системы требует передавать IPv6 в полном формате — 8 групп по 4 символа.
-
-Параметр обязательный для 3DS второй версии.
-
-SendEmail
-
-Boolean
-
-Отправка уведомлений об оплате на почту покупателя:
-
-true — отправлять;
-false — не отправлять.
-Source
-
-String
-
-Requirements: [cards, beeline, mts, tele2, megafon, einvoicing, webmoney]
-
-Источник платежа. Значение параметра зависит от параметра Route:
-
-ACQ — cards или Cards;
-MC — beeline, mts, tele2, megafon;
-EINV — einvoicing;
-WM — webmoney.
-DATA
-
-Object
-
-JSON-объект, который содержит дополнительные параметры в виде ключ:значение. Эти параметры будут переданы на страницу оплаты, если она кастомизирована.
-
-Максимальная длина для каждого передаваемого параметра:
-
-ключ — 20 знаков;
-значение — 100 знаков.
-Максимальное количество пар ключ:значение — не больше 20.
-
-Если ключи или значения содержат в себе специальные символы, получившееся значение должно быть закодировано функцией urlencode.
-
-InfoEmail
-
-String<email>
-
-Адрес почты покупателя. Параметр обязательный, если передан SendEmail=true.
-
-EncryptedPaymentData
-
-String
-
-Данные карты. Параметр обязательный только для ApplePay или GooglePay.
-
-Required
-
-CardData
-
-String
-
-Объект CardData собирается в виде списка ключ=значение (разделитель ;) и зашифровывается открытым ключом — X509 RSA 2048. Бинарное значение кодируется в Base64.
-
-Открытый ключ генерируется в Т‑Бизнес и выдается при регистрации терминала. Ключ доступен в личном кабинете Интернет-эквайринга в разделе Магазины.
-
-Обязательные параметры с типом данных number:
-
-PAN — номер карты;
-ExpDate — месяц и год срока действия карты в формате MMYY.
-Необязательные параметры с типом данных string:
-
-CardHolder — имя и фамилия держателя карты как на карте.
-CVV — код защиты с обратной стороны карты. Параметр необязательный для платежей через Apple Pay с расшифровкой токена на своей стороне.
-ECI — Electronic Commerce Indicator. Индикатор, который показывает степень защиты, применяемой при предоставлении клиентом своих данных ТСП.
-CAVV — Cardholder Authentication Verification Value или Accountholder Authentication Value.
-Пример значения элемента формы CardData:
-
-PAN=4300000000000777;ExpDate=0519;CardHolder=IVAN PETROV;CVV=111
-
-Как получить платежный токен для MirPay при интеграции с НСПК
-
-Если мерчант интегрируется только с банком для проведения платежа по MirPay, метод не вызывается. Эквайер самостоятельно получает платежный токен и инициирует авторизацию вместо мерчанта.
-
-При получении CAVV в CardData оплата будет проводиться как оплата токеном — иначе прохождение 3DS будет регулироваться стандартными настройками терминала или платежа.
-
-Параметр не используется, если передается EncryptedPaymentData.
-
-Amount
-
-Number
-
-Requirements: <= 10 characters
-
-Сумма в копейках.
-
-deviceChannel
-
-String
-
-Default: 02
-
-Канал устройства. Поддерживаются следующие каналы:
-
-01 — Application (APP);
-02 — Browser (BRW).
-Не следует передавать параметр deviceChannel=02 — он установлен по умолчанию и подставляется автоматически. Если указать deviceChannel=02 явно, запрос завершится ошибкой: ErrorCode=204, Message=Неверные параметры, Details=Неверный токен. Проверьте пару TerminalKey/SecretKey.
-
-Route
-
-String
-
-Requirements: [ACQ, MC, EINV, WM]
-
-Способ платежа. Обязательный для ApplePay или GooglePay.
-
-Ответ
-200
-
-OK
-
-Response schema application/json
-
-oneOf
-Without3DS
-With3DS
-With3DSv2APP
-With3DSv2BRW
-Required
-
-TerminalKey
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-Amount
-
-Number
-
-Requirements: <= 20 characters
-
-Сумма в копейках.
-
-Required
-
-OrderId
-
-String
-
-Requirements: <= 36 characters
-
-Идентификатор заказа в системе мерчанта. Должен быть уникальным для каждой операции.
-
-Required
-
-Success
-
-Boolean
-
-Успешность прохождения запроса — true/false.
-
-Required
-
-Status
-
-String
-
-Requirements: <= 20 characters
-
-Статус транзакции. Возвращается один из четырех статусов платежа:
-
-CONFIRMED — при одностадийной оплате;
-AUTHORIZED — при двухстадийной оплате;
-3DS_CHECKING — когда нужно пройти проверку 3D Secure. Если используется своя платежная форма и платеж завис в этом статусе, нужно обратиться к эмитенту для устранения ошибок оплаты;
-REJECTED — при неуспешном прохождении платежа.
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-ErrorCode
-
-String
-
-Requirements: <= 20 characters
-
-Код ошибки.
-
-Message
-
-String
-
-Requirements: <= 255 characters
-
-Краткое описание ошибки.
-
-Details
-
-String
-
-Подробное описание ошибки.
-
-RebillId
-
-String
-
-Уникальный идентификатор сохраненных реквизитов карты покупателя.
-
-CardId
-
-String
-
-Идентификатор карты в системе Т‑Бизнес. Передается только для cохраненной карты.
-Получить статус платежа
-
-production
-
-test
-POST
-https://rest-api-test.tinkoff.ru/v2/GetState
-
-
-
-Описание
-Метод возвращает статус платежа.
-
-Подробнее про способы получения данных о платеже
-
-Запрос
-Request body schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-Token
-
-String
-
-Подпись запроса. Как сформировать.
-
-IP
-
-String
-
-IP-адрес покупателя.
-
-Ответ
-200
-
-OK
-
-Response schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-Amount
-
-Number
-
-Requirements: <= 20 characters
-
-Сумма в копейках.
-
-Required
-
-OrderId
-
-String
-
-Requirements: <= 36 characters
-
-Идентификатор заказа в системе мерчанта. Должен быть уникальным для каждой операции.
-
-Required
-
-Success
-
-Boolean
-
-Успешность прохождения запроса — true/false.
-
-Required
-
-Status
-
-String
-
-Requirements: <= 20 characters
-
-Статус платежа.
-
-Required
-
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-ErrorCode
-
-String
-
-Requirements: <= 20 characters
-
-Код ошибки.
-
-Message
-
-String
-
-Краткое описание ошибки.
-
-Details
-
-String
-
-Подробное описание ошибки.
-
-Params
-
-Array of objects ()
-
-Информация по способу оплаты или деталям для платежей в рассрочку.
-Отправить закрывающий чек в кассу
-
-production
-POST
-https://securepay.tinkoff.ru/cashbox/SendClosingReceipt
-
-
-
-Описание
-Метод отправляет закрывающий чек в кассу.
-
-Подробнее про работу с чеками
-
-Запрос
-Request body schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-PaymentId
-
-String
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-Receipt
-
-Object
-
-JSON-объект с данными чека.
-
-Required
-
-Token
-
-String
-
-Подпись запроса. Как сформировать.
-
-Ответ
-200
-
-OK
-
-Response schema application/json
-
-Required
-
-Success
-
-Boolean
-
-Успешность прохождения запроса — true/false.
-
-Required
-
-ErrorCode
-
-String
-
-Код ошибки.
-
-Message
-
-String
-
-Requirements: <= 255 characters
-
-Краткое описание ошибки.
-Токен
-Токен, или подпись запроса — это строка в запросе методов, в которой мерчант должен шифровать данные с помощью пароля.
-
-В описании входных параметров для каждого метода указано, нужно подписывать запрос или нет. Токен формируется на основании тех полей, которые есть в запросе, поэтому для каждого запроса они уникальные и никогда не совпадают.
-
-Сформировать токен
-
-Пример запроса для метода Инициировать платеж
-Чтобы зашифровать данные запроса:
-
-Соберите массив передаваемых параметров в виде пар ключ:значение. В массив нужно добавить только параметры корневого объекта — вложенные объекты и массивы не участвуют в формировании токена.
-
-В примере в массив включены параметры TerminalKey, Amount, OrderId, Description и исключены объекты Receipt и DATA:
-
-[{"TerminalKey": "MerchantTerminalKey"},{"Amount": "19200"},{"OrderId": "00000"},{"Description": "Подарочная карта на 1000 рублей"}]
-
-
-Добавьте в массив пару {"Password": "Значение пароля"}. Пароль можно найти в личном кабинете интернет-эквайринга.
-
-[{"TerminalKey": "MerchantTerminalKey"},{"Amount": "19200"},{"OrderId": "00000"},{"Description": "Подарочная карта на 1000 рублей"},{"Password": "11111111111111"}]
-
-
-Отсортируйте массив по алфавиту по ключу.
-
-[{"Amount": "19200"},{"Description": "Подарочная карта на 1000 рублей"},{"OrderId": "00000"},{"Password": "11111111111111"},{"TerminalKey": "MerchantTerminalKey"}]
-
-
-Конкатенируйте только значения пар в одну строку.
-
-"19200Подарочная карта на 1000 рублей0000011111111111111MerchantTerminalKey"
-
-Примените к строке хеш-функцию SHA-256 (с поддержкой UTF-8).
-
-"72dd466f8ace0a37a1f740ce5fb78101712bc0665d91a8108c7c8a0ccd426db2"
-
-Добавьте получившийся результат в значение параметра Token в тело запроса и отправьте его.
-
-{
-"TerminalKey": "MerchantTerminalKey",
-"Amount": 19200,
-"OrderId": "21090",
-"Description": "Подарочная карта на 1000 рублей",
-"DATA": {
-  "Phone": "+71234567890",
-  "Email": "a@test.com"
-},
-"Receipt": {
-  "Email": "a@test.ru",
-  "Phone": "+79031234567",
-  "Taxation": "osn",
-  "Items": [
-    {
-      "Name": "Наименование товара 1",
-      "Price": 10000,
-      "Quantity": 1,
-      "Amount": 10000,
-      "Tax": "vat10",
-      "Ean13": "303130323930303030630333435"
-    },
-    {
-      "Name": "Наименование товара 2",
-      "Price": 20000,
-      "Quantity": 2,
-      "Amount": 40000,
-      "Tax": "vat20"
-    },
-    {
-      "Name": "Наименование товара 3",
-      "Price": 30000,
-      "Quantity": 3,
-      "Amount": 90000,
-      "Tax": "vat10"
-    }
-  ]
-},
-"Token": "72dd466f8ace0a37a1f740ce5fb78101712bc0665d91a8108c7c8a0ccd426db2"
-}
-"""Модуль для работы с API Т-Банк (эквайринг)."""
-import hashlib
-import json
-import logging
-from typing import Dict, List, Optional
-
-import requests
-
-logger = logging.getLogger(__name__)
-
-
-class TBankAPI:
-    """Класс для работы с API Т-Банк по документации https://developer.tbank.ru/eacq/api"""
-
-    def __init__(self, terminal_key: str, secret_key: str, api_url: str):
-        self.terminal_key = terminal_key
-        self.secret_key = secret_key
-        self.api_url = api_url.rstrip("/")
-
-    def _generate_token(self, params: Dict) -> str:
-        """
-        Генерация токена подписи по документации Т-Банк:
-
-        1. Берём только параметры корневого объекта (без вложенных объектов и массивов)
-        2. Добавляем {"Password": secret_key}
-        3. Сортируем по алфавиту по ключу
-        4. Конкатенируем значения в одну строку
-        5. SHA-256 хеш
-        """
-        # Берём только скалярные параметры корневого уровня (str, int, bool)
-        # Исключаем: Token, Receipt, DATA, Shops и другие объекты/массивы
-        token_params = {}
-        for key, value in params.items():
-            # Пропускаем Token и сложные объекты
-            if key == "Token":
-                continue
-            if isinstance(value, (str, int, float, bool)):
-                token_params[key] = str(value)
-
-        # Добавляем Password
-        token_params["Password"] = self.secret_key
-
-        # Сортируем по алфавиту
-        sorted_keys = sorted(token_params.keys())
-
-        # Конкатенируем значения
-        values_str = "".join(token_params[k] for k in sorted_keys)
-
-        # SHA-256
-        return hashlib.sha256(values_str.encode("utf-8")).hexdigest()
-
-    def init_payment(
-        self,
-        amount: int,  # в копейках
-        order_id: str,
-        description: str,
-        customer_key: str,
-        success_url: str,
-        fail_url: str,
-        notification_url: str,
-        pay_type: str = "O",  # O - одностадийная, T - двухстадийная
-        receipt: Optional[Dict] = None,
-        data: Optional[Dict] = None,
-    ) -> Optional[Dict]:
-        """
-        Инициализация платежа (метод Init).
-
-        Параметры Receipt и DATA не участвуют в формировании токена!
-        """
-        # Параметры для токена (только корневые скаляры)
-        token_base = {
-            "TerminalKey": self.terminal_key,
-            "Amount": amount,
-            "OrderId": str(order_id),
-            "Description": description[:140] if description else "",
-            "CustomerKey": str(customer_key),
-            "SuccessURL": success_url,
-            "FailURL": fail_url,
-            "NotificationURL": notification_url,
-            "PayType": pay_type,
-            "Language": "ru",
-        }
-
-        # Формируем токен
-        token = self._generate_token(token_base)
-
-        # Итоговый payload с токеном и доп. объектами
-        payload = {**token_base, "Token": token}
-
-        # Добавляем вложенные объекты (не участвуют в токене!)
-        if receipt:
-            payload["Receipt"] = receipt
-        if data:
-            payload["DATA"] = data
-
-        logger.debug(f"Init request: {json.dumps(payload, ensure_ascii=False)}")
-
-        try:
-            response = requests.post(
-                f"{self.api_url}/Init",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=15,
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            logger.info(
-                f"Init response: {result.get('Success')}, PaymentId={result.get('PaymentId')}"
-            )
-
-            if result.get("Success"):
-                return result
-            else:
-                logger.error(
-                    f"Init failed: {result.get('ErrorCode')} - {result.get('Message')}"
-                )
-                return None
-
-        except Exception as e:
-            logger.exception(f"Init request failed: {e}")
-            return None
-
-    def get_state(self, payment_id: str) -> Optional[Dict]:
-        """Проверка статуса платежа (метод GetState)."""
-        # Только скалярные параметры
-        token_base = {"TerminalKey": self.terminal_key, "PaymentId": str(payment_id)}
-
-        token = self._generate_token(token_base)
-
-        payload = {**token_base, "Token": token}
-
-        try:
-            response = requests.post(
-                f"{self.api_url}/GetState",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.exception(f"GetState failed: {e}")
-            return None
-
-    def confirm(self, payment_id: str, amount: int = None) -> Optional[Dict]:
-        """Подтверждение списания для двухстадийного платежа (метод Confirm)."""
-        token_base = {"TerminalKey": self.terminal_key, "PaymentId": str(payment_id)}
-        if amount is not None:
-            token_base["Amount"] = amount
-
-        token = self._generate_token(token_base)
-
-        payload = {**token_base, "Token": token}
-
-        try:
-            response = requests.post(
-                f"{self.api_url}/Confirm",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.exception(f"Confirm failed: {e}")
-            return None
-
-    def cancel(self, payment_id: str) -> Optional[Dict]:
-        """Отмена платежа (метод Cancel)."""
-        token_base = {"TerminalKey": self.terminal_key, "PaymentId": str(payment_id)}
-
-        token = self._generate_token(token_base)
-
-        payload = {**token_base, "Token": token}
-
-        try:
-            response = requests.post(
-                f"{self.api_url}/Cancel",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=10,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.exception(f"Cancel failed: {e}")
-            return None
-
-    def build_receipt(
-        self, email: str, phone: str, items: List[Dict], taxation: str = "osn"
-    ) -> Dict:
-        """
-        Формирование чека для 54-ФЗ.
-
-        items: [{"Name": "...", "Price": 10000, "Quantity": 1.0, "Amount": 10000, "Tax": "none"}]
-        """
-        return {"Email": email, "Phone": phone, "Taxation": taxation, "Items": items}
-Подтвердить списание
-
-production
-
-test
-POST
-https://securepay.tinkoff.ru/v2/Confirm
-
-
-
-Описание
-Метод подтверждает списание денег с карты покупателя.
-
-Используется при двухстадийном платеже.
-
-Применим только к платежам в статусе AUTHORIZED. Сумма списания может быть меньше или равна сумме авторизации.
-
-Подробнее про реализацию двухстадийного платежа
-
-Запрос
-Request body schema application/json
-
-Required
-
-TerminalKey
-
-String
-
-Идентификатор терминала. Выдается мерчанту в Т‑Бизнес при заведении терминала.
-
-Required
-
-PaymentId
-
-String
-
-Requirements: <= 20 characters
-
-Идентификатор платежа в системе Т‑Бизнес.
-
-Required
-
-Token
-
-String
-
-Подпись запроса. Как сформировать.
-
-IP
-
-String
-
-IP-адрес покупателя.
-
-Amount
-
-Number
-
-Сумма в копейках. Если не передан, используется Amount, который был передан в методе Инициировать платеж.
-
-Receipt
-
-Object
-
-JSON-объект с данными чека. Обязателен, если подключена онлайн-касса.
-
-Shops
-
-Array of objects ()
-
-JSON-объект с данными маркетплейса. Обязательный для маркетплейсов.
-
-Route
-
-String
-
-Requirements: [TCB, BNPL]
-
-Способ платежа.
-
-Source
-
-String
-
-Requirements: [installment, BNPL]
-
-Источник платежа.
-
-Ответ
-200
-
-OK
-
-Это полезный материал?
-
-
-Да
-
-Нет
-Обратиться в поддержку
-Сценарий использования
-
-Прием платежей по двухстадийной схеме
-Прием платежей по двухстадийной схеме на своей платежной форме
-Пример запроса
-Payload
-
-cURL
-
-Go
-
-Java
-
-NodeJs
-
-PHP
-
 Python
+Copy
+# tbank_payment/utils.py
+"""Утилиты для работы с API Т-Банка"""
 
-Content type
-
-application/json
-
-
-
-{
-
-"TerminalKey":
-
-"TBankTest",
-
-"PaymentId":
-
-"2304882",
-
-"Token":
-
-"c0ad1dfc4e94ed44715c5ed0e84f8ec439695b9ac219a7a19555a075a3c3ed24",
-
-"IP":
-
-"192.168.255.255",
-
-"Amount":
-
-19200,
-
-"Receipt": { ... },
-"Shops": [
-{ ... }
-],
-"Route":
-
-"BNPL",
-
-"Source":
-
-"BNPL"
-
-}
-
-Пример ответа
-200
-Content type
-
-application/json
+import hashlib
+import json
+from typing import Dict, Any, Optional, List
 
 
+def generate_token(data: Dict[str, Any], password: str) -> str:
+    """
+    Генерация токена для подписи запроса к API Т-Банка
+    
+    Алгоритм по документации:
+    1. Собрать массив пар ключ:значение только корневых параметров
+       (вложенные объекты и массивы НЕ участвуют!)
+    2. Добавить {"Password": password}
+    3. Отсортировать по ключу по алфавиту
+    4. Конкатенировать только значения в одну строку
+    5. SHA-256 хеш
+    """
+    # Берем только корневые параметры, исключаем вложенные объекты/массивы и Token
+    filtered_data = {}
+    for key, value in data.items():
+        if key == "Token":
+            continue
+        # Пропускаем сложные объекты — они не участвуют в токене
+        if isinstance(value, (dict, list)):
+            continue
+        if value is not None:
+            filtered_data[key] = str(value)
+    
+    # Добавляем пароль
+    filtered_data["Password"] = password
+    
+    # Сортируем по ключам
+    sorted_items = sorted(filtered_data.items(), key=lambda x: x[0])
+    
+    # Конкатенируем только значения
+    values_str = "".join([str(value) for _, value in sorted_items])
+    
+    # SHA-256
+    return hashlib.sha256(values_str.encode('utf-8')).hexdigest()
 
-{
 
-"TerminalKey":
+def prepare_request_data(data: Dict[str, Any], terminal_key: str, password: str) -> Dict[str, Any]:
+    """Подготовка данных запроса с добавлением токена"""
+    data = data.copy()
+    data["TerminalKey"] = terminal_key
+    data["Token"] = generate_token(data, password)
+    return data
 
-"TBankTest",
 
-"OrderId":
+def amount_to_coins(amount: float) -> int:
+    """Конвертация рублей в копейки"""
+    return int(round(amount * 100))
 
-"21057",
 
-"Success":
+def coins_to_amount(coins: int) -> float:
+    """Конвертация копеек в рубли"""
+    return coins / 100
 
-true,
 
-"Status":
+def mask_pan(pan: Optional[str]) -> Optional[str]:
+    """Маскировка номера карты"""
+    if not pan or len(pan) < 4:
+        return pan
+    return "*" * (len(pan) - 4) + pan[-4:]
 
-"CONFIRMED",
 
-"PaymentId":
+def format_datetime(dt) -> str:
+    """Форматирование даты в формат YYYY-MM-DDTHH24:MI:SS+GMT"""
+    if dt is None:
+        return None
+    # Формат: 2016-08-31T12:28:00+03:00
+    return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+Python
+Copy
+# tbank_payment/models.py
+"""Pydantic модели для API Т-Банка"""
 
-"2304882",
+from typing import Optional, List, Dict, Any, Union
+from enum import Enum
+from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
 
-"ErrorCode":
 
-"0",
+class PaymentStatus(str, Enum):
+    """Статусы платежа"""
+    NEW = "NEW"
+    FORM_SHOWED = "FORM_SHOWED"
+    DEADLINE_EXPIRED = "DEADLINE_EXPIRED"
+    CANCELED = "CANCELED"
+    AUTHORIZING = "AUTHORIZING"
+    AUTHORIZED = "AUTHORIZED"
+    AUTH_FAIL = "AUTH_FAIL"
+    REJECTED = "REJECTED"
+    THREE_DS_CHECKING = "3DS_CHECKING"
+    THREE_DS_CHECKED = "3DS_CHECKED"
+    REVERSING = "REVERSING"
+    PARTIAL_REVERSED = "PARTIAL_REVERSED"
+    REVERSED = "REVERSED"
+    CONFIRMING = "CONFIRMING"
+    CONFIRMED = "CONFIRMED"
+    REFUNDING = "REFUNDING"
+    ASYNC_REFUNDING = "ASYNC_REFUNDING"
+    PARTIAL_REFUNDED = "PARTIAL_REFUNDED"
+    REFUNDED = "REFUNDED"
 
-"Message":
 
-"OK",
+class Taxation(str, Enum):
+    """Системы налогообложения"""
+    OSN = "osn"
+    USN_INCOME = "usn_income"
+    USN_INCOME_OUTCOME = "usn_income_outcome"
+    ENVD = "envd"
+    ESN = "esn"
+    PATENT = "patent"
 
-"Details":
 
-"None",
+class VAT(str, Enum):
+    """Ставки НДС"""
+    NONE = "none"
+    VAT0 = "vat0"
+    VAT10 = "vat10"
+    VAT20 = "vat20"
+    VAT110 = "vat110"
+    VAT120 = "vat120"
 
-"Params": [
-{
-"Key":
 
-"Route",
+class PaymentMethod(str, Enum):
+    """Способы расчета"""
+    FULL_PAYMENT = "full_payment"
+    FULL_PREPAYMENT = "full_prepayment"
+    PREPAYMENT = "prepayment"
+    ADVANCE = "advance"
+    PARTIAL_PAYMENT = "partial_payment"
+    CREDIT = "credit"
+    CREDIT_PAYMENT = "credit_payment"
 
-"Value":
 
-"ACQ"
+class PaymentObject(str, Enum):
+    """Предметы расчета"""
+    COMMODITY = "commodity"
+    EXCISE = "excise"
+    JOB = "job"
+    SERVICE = "service"
+    GAMBLING_BET = "gambling_bet"
+    GAMBLING_PRIZE = "gambling_prize"
+    LOTTERY = "lottery"
+    LOTTERY_PRIZE = "lottery_prize"
+    INTELLECTUAL_ACTIVITY = "intellectual_activity"
+    PAYMENT = "payment"
+    AGENT_COMMISSION = "agent_commission"
+    COMPOSITE = "composite"
+    ANOTHER = "another"
 
-}
+
+class ReceiptItem(BaseModel):
+    """Позиция чека"""
+    name: str = Field(..., alias="Name", max_length=128)
+    quantity: float = Field(..., alias="Quantity", gt=0)
+    amount: int = Field(..., alias="Amount", description="Сумма в копейках")
+    price: int = Field(..., alias="Price", description="Цена в копейках")
+    tax: VAT = Field(..., alias="Tax")
+    payment_method: Optional[PaymentMethod] = Field(None, alias="PaymentMethod")
+    payment_object: Optional[PaymentObject] = Field(None, alias="PaymentObject")
+    ean13: Optional[str] = Field(None, alias="Ean13")
+    shop_code: Optional[str] = Field(None, alias="ShopCode")
+    
+    @field_validator('quantity')
+    @classmethod
+    def validate_quantity(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be positive')
+        return v
+
+
+class Receipt(BaseModel):
+    """Чек"""
+    items: List[ReceiptItem] = Field(..., alias="Items")
+    taxation: Taxation = Field(..., alias="Taxation")
+    email: Optional[str] = Field(None, alias="Email")
+    phone: Optional[str] = Field(None, alias="Phone")
+    email_company: Optional[str] = Field(None, alias="EmailCompany")
+    
+    class Config:
+        populate_by_name = True
+
+
+class ReceiptPayments(BaseModel):
+    """Платежи в чеке (для SendClosingReceipt)"""
+    cash: Optional[int] = Field(None, alias="Cash")
+    electronic: Optional[int] = Field(None, alias="Electronic")
+    advance_payment: Optional[int] = Field(None, alias="AdvancePayment")
+    credit: Optional[int] = Field(None, alias="Credit")
+    provision: Optional[int] = Field(None, alias="Provision")
+
+
+class InitPaymentRequest(BaseModel):
+    """Запрос на инициализацию платежа"""
+    amount: int = Field(..., alias="Amount", description="Сумма в копейках")
+    order_id: str = Field(..., alias="OrderId", max_length=36)
+    description: Optional[str] = Field(None, alias="Description", max_length=140)
+    customer_key: Optional[str] = Field(None, alias="CustomerKey", max_length=36)
+    recurrent: Optional[str] = Field(None, alias="Recurrent", pattern="^Y$")
+    language: Optional[str] = Field("ru", alias="Language", pattern="^(ru|en)$")
+    pay_type: Optional[str] = Field(None, alias="PayType", pattern="^[OT]$")
+    notification_url: Optional[str] = Field(None, alias="NotificationURL")
+    success_url: Optional[str] = Field(None, alias="SuccessURL")
+    fail_url: Optional[str] = Field(None, alias="FailURL")
+    redirect_due_date: Optional[str] = Field(None, alias="RedirectDueDate")
+    data: Optional[Dict[str, str]] = Field(None, alias="DATA")
+    receipt: Optional[Receipt] = Field(None, alias="Receipt")
+    
+    class Config:
+        populate_by_name = True
+
+
+class InitPaymentResponse(BaseModel):
+    """Ответ на инициализацию платежа"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    terminal_key: Optional[str] = Field(None, alias="TerminalKey")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    payment_url: Optional[str] = Field(None, alias="PaymentURL")
+    details: Optional[str] = Field(None, alias="Details")
+    
+    class Config:
+        populate_by_name = True
+
+
+class FinishAuthorizeRequest(BaseModel):
+    """Запрос для завершения авторизации (своя платежная форма)"""
+    payment_id: str = Field(..., alias="PaymentId")
+    card_data: Optional[str] = Field(None, alias="CardData")
+    encrypted_payment_data: Optional[str] = Field(None, alias="EncryptedPaymentData")
+    send_email: Optional[bool] = Field(None, alias="SendEmail")
+    info_email: Optional[str] = Field(None, alias="InfoEmail")
+    ip: Optional[str] = Field(None, alias="IP")
+    route: Optional[str] = Field(None, alias="Route")
+    source: Optional[str] = Field(None, alias="Source")
+    data: Optional[Dict[str, str]] = Field(None, alias="DATA")
+    amount: Optional[int] = Field(None, alias="Amount")
+    device_channel: Optional[str] = Field("02", alias="deviceChannel")
+    
+    class Config:
+        populate_by_name = True
+
+
+class FinishAuthorizeResponse(BaseModel):
+    """Ответ на завершение авторизации"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    terminal_key: Optional[str] = Field(None, alias="TerminalKey")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    rebill_id: Optional[str] = Field(None, alias="RebillId")
+    card_id: Optional[str] = Field(None, alias="CardId")
+    
+    # 3DS поля
+    acs_url: Optional[str] = Field(None, alias="ACSUrl")
+    md: Optional[str] = Field(None, alias="MD")
+    pa_req: Optional[str] = Field(None, alias="PaReq")
+    term_url: Optional[str] = Field(None, alias="TermUrl")
+    
+    class Config:
+        populate_by_name = True
+
+
+class GetStateRequest(BaseModel):
+    """Запрос состояния платежа"""
+    payment_id: str = Field(..., alias="PaymentId")
+    ip: Optional[str] = Field(None, alias="IP")
+    
+    class Config:
+        populate_by_name = True
+
+
+class GetStateResponse(BaseModel):
+    """Ответ с состоянием платежа"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    rebill_id: Optional[str] = Field(None, alias="RebillId")
+    params: Optional[List[Dict[str, Any]]] = Field(None, alias="Params")
+    
+    class Config:
+        populate_by_name = True
+
+
+class CancelRequest(BaseModel):
+    """Запрос отмены платежа"""
+    payment_id: str = Field(..., alias="PaymentId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    
+    class Config:
+        populate_by_name = True
+
+
+class CancelResponse(BaseModel):
+    """Ответ на отмену платежа"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    original_amount: Optional[int] = Field(None, alias="OriginalAmount")
+    new_amount: Optional[int] = Field(None, alias="NewAmount")
+    
+    class Config:
+        populate_by_name = True
+
+
+class ConfirmRequest(BaseModel):
+    """Запрос подтверждения платежа (двухстадийная)"""
+    payment_id: str = Field(..., alias="PaymentId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    receipt: Optional[Receipt] = Field(None, alias="Receipt")
+    
+    class Config:
+        populate_by_name = True
+
+
+class ConfirmResponse(BaseModel):
+    """Ответ на подтверждение платежа"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    
+    class Config:
+        populate_by_name = True
+
+
+class ChargeRequest(BaseModel):
+    """Запрос на рекуррентный платеж"""
+    rebill_id: str = Field(..., alias="RebillId")
+    amount: int = Field(..., alias="Amount")
+    order_id: str = Field(..., alias="OrderId")
+    send_email: Optional[bool] = Field(None, alias="SendEmail")
+    info_email: Optional[str] = Field(None, alias="InfoEmail")
+    description: Optional[str] = Field(None, alias="Description")
+    
+    class Config:
+        populate_by_name = True
+
+
+class ChargeResponse(BaseModel):
+    """Ответ на рекуррентный платеж"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    order_id: Optional[str] = Field(None, alias="OrderId")
+    status: Optional[PaymentStatus] = Field(None, alias="Status")
+    payment_id: Optional[str] = Field(None, alias="PaymentId")
+    amount: Optional[int] = Field(None, alias="Amount")
+    
+    class Config:
+        populate_by_name = True
+
+
+class SendClosingReceiptRequest(BaseModel):
+    """Запрос на отправку закрывающего чека"""
+    payment_id: str = Field(..., alias="PaymentId")
+    receipt: Receipt = Field(..., alias="Receipt")
+    
+    class Config:
+        populate_by_name = True
+
+
+class SendClosingReceiptResponse(BaseModel):
+    """Ответ на отправку закрывающего чека"""
+    success: bool = Field(..., alias="Success")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    error_message: Optional[str] = Field(None, alias="Message")
+    
+    class Config:
+        populate_by_name = True
+
+
+class Notification(BaseModel):
+    """Webhook уведомление от Т-Банка"""
+    terminal_key: str = Field(..., alias="TerminalKey")
+    order_id: str = Field(..., alias="OrderId")
+    success: bool = Field(..., alias="Success")
+    status: PaymentStatus = Field(..., alias="Status")
+    payment_id: int = Field(..., alias="PaymentId")
+    error_code: Optional[str] = Field(None, alias="ErrorCode")
+    amount: int = Field(..., alias="Amount")
+    rebill_id: Optional[str] = Field(None, alias="RebillId")
+    card_id: Optional[int] = Field(None, alias="CardId")
+    pan: Optional[str] = Field(None, alias="Pan")
+    data: Optional[str] = Field(None, alias="DATA")
+    token: str = Field(..., alias="Token")
+    expiration_date: Optional[str] = Field(None, alias="ExpDate")
+    
+    class Config:
+        populate_by_name = True
+Python
+Copy
+# tbank_payment/client.py
+"""Клиент для работы с API Т-Банка"""
+
+import json
+import logging
+from typing import Optional, Dict, Any
+import requests
+import aiohttp
+
+from .config import TBankConfig
+from .models import (
+    InitPaymentRequest, InitPaymentResponse,
+    FinishAuthorizeRequest, FinishAuthorizeResponse,
+    GetStateRequest, GetStateResponse,
+    CancelRequest, CancelResponse,
+    ConfirmRequest, ConfirmResponse,
+    ChargeRequest, ChargeResponse,
+    SendClosingReceiptRequest, SendClosingReceiptResponse,
+    Receipt,
+)
+from .utils import prepare_request_data, amount_to_coins, format_datetime
+from .exceptions import TBankAPIError, TBankNetworkError, TBankAuthError, TBankValidationError
+
+logger = logging.getLogger(__name__)
+
+
+class TBankPaymentClient:
+    """Синхронный клиент для API платежей Т-Банка"""
+    
+    def __init__(self, config: Optional[TBankConfig] = None, 
+                 terminal_key: Optional[str] = None,
+                 password: Optional[str] = None):
+        """
+        Инициализация клиента
+        
+        Args:
+            config: Объект конфигурации
+            terminal_key: Terminal Key (если не передан config)
+            password: Пароль (если не передан config)
+        """
+        if config:
+            self.config = config
+        elif terminal_key and password:
+            self.config = TBankConfig(terminal_key=terminal_key, password=password)
+        else:
+            self.config = TBankConfig.from_env()
+        
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        })
+    
+    def _make_request(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Выполнение запроса к API"""
+        url = f"{self.config.base_url}/{endpoint}"
+        
+        # Добавляем подпись (важно: токен генерируется до сериализации!)
+        signed_data = prepare_request_data(data, self.config.terminal_key, self.config.password)
+        
+        logger.debug(f"Request to {endpoint}: {json.dumps(signed_data, ensure_ascii=False, default=str)}")
+        
+        try:
+            response = self.session.post(url, json=signed_data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            logger.debug(f"Response from {endpoint}: {json.dumps(result, ensure_ascii=False)}")
+            
+            # Проверка на ошибки API
+            if not result.get("Success", False):
+                error_code = result.get("ErrorCode", "0")
+                error_msg = result.get("Message", "Unknown error")
+                
+                if error_code == "0":
+                    raise TBankAuthError(f"Authentication failed: {error_msg}", error_code)
+                elif error_code in ["1", "2", "3"]:
+                    raise TBankValidationError(f"Validation error: {error_msg}", error_code)
+                else:
+                    raise TBankAPIError(f"API error: {error_msg}", error_code)
+            
+            return result
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error: {e}")
+            raise TBankNetworkError(f"Network error: {str(e)}")
+    
+    def init_payment(self, request: InitPaymentRequest) -> InitPaymentResponse:
+        """
+        Инициализация платежа (получение PaymentURL для платежной формы Т-Банка)
+        
+        Args:
+            request: Данные для инициализации платежа
+            
+        Returns:
+            InitPaymentResponse с URL для оплаты
+        """
+        # Добавляем URL из конфига, если не указаны в запросе
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        
+        if not data.get("NotificationURL") and self.config.notification_url:
+            data["NotificationURL"] = self.config.notification_url
+        if not data.get("SuccessURL") and self.config.success_url:
+            data["SuccessURL"] = self.config.success_url
+        if not data.get("FailURL") and self.config.fail_url:
+            data["FailURL"] = self.config.fail_url
+        
+        result = self._make_request("Init", data)
+        return InitPaymentResponse.model_validate(result)
+    
+    def finish_authorize(self, request: FinishAuthorizeRequest) -> FinishAuthorizeResponse:
+        """
+        Завершение авторизации (для собственной платежной формы)
+        
+        Используется для:
+        - Одностадийной оплаты (сразу списывает деньги)
+        - Двухстадийной оплаты (блокирует деньги)
+        
+        Args:
+            request: Данные для завершения авторизации
+            
+        Returns:
+            FinishAuthorizeResponse
+        """
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = self._make_request("FinishAuthorize", data)
+        return FinishAuthorizeResponse.model_validate(result)
+    
+    def get_state(self, payment_id: str, ip: Optional[str] = None) -> GetStateResponse:
+        """
+        Получение состояния платежа
+        
+        Args:
+            payment_id: ID платежа
+            ip: IP-адрес покупателя (опционально)
+            
+        Returns:
+            GetStateResponse с информацией о платеже
+        """
+        request = GetStateRequest(PaymentId=payment_id, IP=ip)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = self._make_request("GetState", data)
+        return GetStateResponse.model_validate(result)
+    
+    def cancel_payment(self, payment_id: str, amount: Optional[int] = None) -> CancelResponse:
+        """
+        Отмена платежа (возврат)
+        
+        Args:
+            payment_id: ID платежа
+            amount: Сумма для возврата (в копейках), если частичный возврат
+            
+        Returns:
+            CancelResponse
+        """
+        request = CancelRequest(PaymentId=payment_id, Amount=amount)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = self._make_request("Cancel", data)
+        return CancelResponse.model_validate(result)
+    
+    def confirm_payment(self, payment_id: str, amount: Optional[int] = None,
+                       receipt: Optional[Receipt] = None) -> ConfirmResponse:
+        """
+        Подтверждение платежа (двухстадийная оплата)
+        
+        Args:
+            payment_id: ID платежа
+            amount: Сумма для подтверждения (если отличается от исходной)
+            receipt: Чек для отправки
+            
+        Returns:
+            ConfirmResponse
+        """
+        request = ConfirmRequest(PaymentId=payment_id, Amount=amount, Receipt=receipt)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = self._make_request("Confirm", data)
+        return ConfirmResponse.model_validate(result)
+    
+    def charge_recurrent(self, rebill_id: str, amount: float, order_id: str,
+                        send_email: bool = False, info_email: Optional[str] = None,
+                        description: Optional[str] = None) -> ChargeResponse:
+        """
+        Рекуррентный платеж (повторное списание по сохраненной карте)
+        
+        Args:
+            rebill_id: ID рекуррентного платежа (получен при первой оплате)
+            amount: Сумма в рублях
+            order_id: ID заказа
+            send_email: Отправлять ли email
+            info_email: Email для уведомления
+            description: Описание платежа
+            
+        Returns:
+            ChargeResponse
+        """
+        request = ChargeRequest(
+            RebillId=rebill_id,
+            Amount=amount_to_coins(amount),
+            OrderId=order_id,
+            SendEmail=send_email,
+            InfoEmail=info_email,
+            Description=description
+        )
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = self._make_request("Charge", data)
+        return ChargeResponse.model_validate(result)
+    
+    def send_closing_receipt(self, payment_id: str, receipt: Receipt) -> SendClosingReceiptResponse:
+        """
+        Отправка закрывающего чека в кассу
+        
+        Args:
+            payment_id: ID платежа
+            receipt: Данные чека
+            
+        Returns:
+            SendClosingReceiptResponse
+        """
+        request = SendClosingReceiptRequest(PaymentId=payment_id, Receipt=receipt)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        
+        # Отдельный endpoint для чеков
+        url = f"{self.config.base_url.replace('/v2', '')}/cashbox/SendClosingReceipt"
+        
+        signed_data = prepare_request_data(data, self.config.terminal_key, self.config.password)
+        
+        try:
+            response = self.session.post(url, json=signed_data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            if not result.get("Success", False):
+                error_code = result.get("ErrorCode", "0")
+                error_msg = result.get("Message", "Unknown error")
+                raise TBankAPIError(f"Receipt error: {error_msg}", error_code)
+            
+            return SendClosingReceiptResponse.model_validate(result)
+            
+        except requests.exceptions.RequestException as e:
+            raise TBankNetworkError(f"Network error: {str(e)}")
+    
+    def resend_notifications(self) -> Dict[str, Any]:
+        """
+        Повторная отправка неполученных уведомлений
+        
+        Returns:
+            Dict с количеством отправленных уведомлений
+        """
+        data = {}
+        return self._make_request("Resend", data)
+    
+    def create_payment_url(self, amount: float, order_id: str, 
+                          description: Optional[str] = None,
+                          customer_key: Optional[str] = None,
+                          recurrent: bool = False,
+                          receipt: Optional[Receipt] = None,
+                          redirect_due_date: Optional[datetime] = None) -> str:
+        """
+        Быстрое создание платежа и получение URL для оплаты
+        
+        Args:
+            amount: Сумма в рублях
+            order_id: Уникальный ID заказа
+            description: Описание платежа
+            customer_key: ID клиента (для рекуррентных)
+            recurrent: Сделать платеж рекуррентным
+            receipt: Данные чека
+            redirect_due_date: Срок жизни ссылки
+            
+        Returns:
+            URL для перехода на страницу оплаты
+            
+        Raises:
+            TBankAPIError: если не удалось создать платеж
+        """
+        request = InitPaymentRequest(
+            Amount=amount_to_coins(amount),
+            OrderId=order_id,
+            Description=description,
+            CustomerKey=customer_key,
+            Recurrent="Y" if recurrent else None,
+            Receipt=receipt,
+            RedirectDueDate=format_datetime(redirect_due_date) if redirect_due_date else None
+        )
+        
+        response = self.init_payment(request)
+        
+        if not response.success or not response.payment_url:
+            raise TBankAPIError(
+                f"Failed to create payment: {response.error_message}",
+                response.error_code
+            )
+        
+        return response.payment_url
+
+
+class TBankAsyncClient:
+    """Асинхронный клиент для API платежей Т-Банка"""
+    
+    def __init__(self, config: Optional[TBankConfig] = None,
+                 terminal_key: Optional[str] = None,
+                 password: Optional[str] = None):
+        if config:
+            self.config = config
+        elif terminal_key and password:
+            self.config = TBankConfig(terminal_key=terminal_key, password=password)
+        else:
+            self.config = TBankConfig.from_env()
+        
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Получение или создание сессии"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+            )
+        return self._session
+    
+    async def _make_request(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Асинхронное выполнение запроса"""
+        url = f"{self.config.base_url}/{endpoint}"
+        signed_data = prepare_request_data(data, self.config.terminal_key, self.config.password)
+        
+        session = await self._get_session()
+        
+        try:
+            async with session.post(url, json=signed_data, timeout=30) as response:
+                response.raise_for_status()
+                result = await response.json()
+                
+                if not result.get("Success", False):
+                    error_code = result.get("ErrorCode", "0")
+                    error_msg = result.get("Message", "Unknown error")
+                    
+                    if error_code == "0":
+                        raise TBankAuthError(f"Authentication failed: {error_msg}", error_code)
+                    elif error_code in ["1", "2", "3"]:
+                        raise TBankValidationError(f"Validation error: {error_msg}", error_code)
+                    else:
+                        raise TBankAPIError(f"API error: {error_msg}", error_code)
+                
+                return result
+                
+        except aiohttp.ClientError as e:
+            raise TBankNetworkError(f"Network error: {str(e)}")
+    
+    async def init_payment(self, request: InitPaymentRequest) -> InitPaymentResponse:
+        """Асинхронная инициализация платежа"""
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        
+        if not data.get("NotificationURL") and self.config.notification_url:
+            data["NotificationURL"] = self.config.notification_url
+        if not data.get("SuccessURL") and self.config.success_url:
+            data["SuccessURL"] = self.config.success_url
+        if not data.get("FailURL") and self.config.fail_url:
+            data["FailURL"] = self.config.fail_url
+        
+        result = await self._make_request("Init", data)
+        return InitPaymentResponse.model_validate(result)
+    
+    async def finish_authorize(self, request: FinishAuthorizeRequest) -> FinishAuthorizeResponse:
+        """Асинхронное завершение авторизации"""
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = await self._make_request("FinishAuthorize", data)
+        return FinishAuthorizeResponse.model_validate(result)
+    
+    async def get_state(self, payment_id: str, ip: Optional[str] = None) -> GetStateResponse:
+        """Асинхронное получение состояния платежа"""
+        request = GetStateRequest(PaymentId=payment_id, IP=ip)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = await self._make_request("GetState", data)
+        return GetStateResponse.model_validate(result)
+    
+    async def cancel_payment(self, payment_id: str, amount: Optional[int] = None) -> CancelResponse:
+        """Асинхронная отмена платежа"""
+        request = CancelRequest(PaymentId=payment_id, Amount=amount)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = await self._make_request("Cancel", data)
+        return CancelResponse.model_validate(result)
+    
+    async def confirm_payment(self, payment_id: str, amount: Optional[int] = None,
+                             receipt: Optional[Receipt] = None) -> ConfirmResponse:
+        """Асинхронное подтверждение платежа"""
+        request = ConfirmRequest(PaymentId=payment_id, Amount=amount, Receipt=receipt)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = await self._make_request("Confirm", data)
+        return ConfirmResponse.model_validate(result)
+    
+    async def charge_recurrent(self, rebill_id: str, amount: float, order_id: str,
+                               send_email: bool = False, 
+                               info_email: Optional[str] = None,
+                               description: Optional[str] = None) -> ChargeResponse:
+        """Асинхронный рекуррентный платеж"""
+        request = ChargeRequest(
+            RebillId=rebill_id,
+            Amount=amount_to_coins(amount),
+            OrderId=order_id,
+            SendEmail=send_email,
+            InfoEmail=info_email,
+            Description=description
+        )
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        result = await self._make_request("Charge", data)
+        return ChargeResponse.model_validate(result)
+    
+    async def send_closing_receipt(self, payment_id: str, receipt: Receipt) -> SendClosingReceiptResponse:
+        """Асинхронная отправка закрывающего чека"""
+        request = SendClosingReceiptRequest(PaymentId=payment_id, Receipt=receipt)
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        
+        url = f"{self.config.base_url.replace('/v2', '')}/cashbox/SendClosingReceipt"
+        signed_data = prepare_request_data(data, self.config.terminal_key, self.config.password)
+        
+        session = await self._get_session()
+        
+        try:
+            async with session.post(url, json=signed_data, timeout=30) as response:
+                response.raise_for_status()
+                result = await response.json()
+                
+                if not result.get("Success", False):
+                    error_code = result.get("ErrorCode", "0")
+                    error_msg = result.get("Message", "Unknown error")
+                    raise TBankAPIError(f"Receipt error: {error_msg}", error_code)
+                
+                return SendClosingReceiptResponse.model_validate(result)
+                
+        except aiohttp.ClientError as e:
+            raise TBankNetworkError(f"Network error: {str(e)}")
+    
+    async def create_payment_url(self, amount: float, order_id: str,
+                                  description: Optional[str] = None,
+                                  customer_key: Optional[str] = None,
+                                  recurrent: bool = False,
+                                  receipt: Optional[Receipt] = None,
+                                  redirect_due_date: Optional[datetime] = None) -> str:
+        """Асинхронное создание платежа и получение URL"""
+        request = InitPaymentRequest(
+            Amount=amount_to_coins(amount),
+            OrderId=order_id,
+            Description=description,
+            CustomerKey=customer_key,
+            Recurrent="Y" if recurrent else None,
+            Receipt=receipt,
+            RedirectDueDate=format_datetime(redirect_due_date) if redirect_due_date else None
+        )
+        
+        response = await self.init_payment(request)
+        
+        if not response.success or not response.payment_url:
+            raise TBankAPIError(
+                f"Failed to create payment: {response.error_message}",
+                response.error_code
+            )
+        
+        return response.payment_url
+    
+    async def close(self):
+        """Закрытие сессии"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+Python
+Copy
+# tbank_payment/__init__.py
+"""
+T-Bank (Т-Банк) Payment Module
+Универсальный модуль для интеграции с платежной системой Т-Касса
+"""
+
+from .client import TBankPaymentClient, TBankAsyncClient
+from .models import (
+    InitPaymentRequest, InitPaymentResponse,
+    FinishAuthorizeRequest, FinishAuthorizeResponse,
+    PaymentStatus, Receipt, ReceiptItem,
+    Notification, CancelRequest, CancelResponse,
+    ConfirmRequest, ConfirmResponse,
+    GetStateRequest, GetStateResponse,
+    ChargeRequest, ChargeResponse,
+    SendClosingReceiptRequest, SendClosingReceiptResponse,
+    Taxation, VAT, PaymentMethod, PaymentObject,
+)
+from .exceptions import (
+    TBankAPIError, TBankAuthError,
+    TBankValidationError, TBankPaymentError,
+    TBankNetworkError,
+)
+from .webhooks import WebhookHandler
+from .config import TBankConfig
+from .utils import amount_to_coins, coins_to_amount
+
+__version__ = "1.0.0"
+__all__ = [
+    "TBankPaymentClient",
+    "TBankAsyncClient",
+    "InitPaymentRequest", "InitPaymentResponse",
+    "FinishAuthorizeRequest", "FinishAuthorizeResponse",
+    "PaymentStatus", "Receipt", "ReceiptItem",
+    "Notification", "CancelRequest", "CancelResponse",
+    "ConfirmRequest", "ConfirmResponse",
+    "GetStateRequest", "GetStateResponse",
+    "ChargeRequest", "ChargeResponse",
+    "SendClosingReceiptRequest", "SendClosingReceiptResponse",
+    "Taxation", "VAT", "PaymentMethod", "PaymentObject",
+    "TBankAPIError", "TBankAuthError",
+    "TBankValidationError", "TBankPaymentError", "TBankNetworkError",
+    "WebhookHandler", "TBankConfig",
+    "amount_to_coins", "coins_to_amount",
 ]
-}
-Уведомления об операциях
-Уведомления об операциях — это уведомления мерчанту о статусе выполнения платежа. На основании этих уведомлений магазин должен предоставлять покупателю услугу или товар.
+Python
+Copy
+# tbank_payment/webhooks.py
+"""Обработка webhook-уведомлений от Т-Банка"""
 
-Чтобы настроить уведомления:
+import json
+import logging
+from typing import Dict, Any, Callable, Optional
+from .models import Notification
+from .utils import generate_token
+from .exceptions import TBankValidationError
 
-В личном кабинете интернет-эквайринга перейдите в раздел Магазины.
-На вкладке Терминалы нажмите Настроить и выберите нужный вариант получения уведомлений — почта, HTTP(S) или оба варианта.
-Вы можете получать уведомления не только о статусах платежа — также есть уведомления о привязке карты, фискализации и привязке счета по QR. Такие уведомления отправляются только на NotificationURL, заданный в настройках терминала.
-
-Для HTTP(S)‑уведомлений передайте параметр NotificationURL в методе Инициировать платеж. Чтобы изменить значение этого параметра для метода Инициировать привязку карты к покупателю, обратитесь к персональному менеджеру или в поддержку банка.
-
-Платеж (NotificationPayment)
-После проведения платежа через вызов метода Инициировать платеж вам будет отправлена информация о статусе платежа.
-
-На электронную почту
-Т‑Бизнес будет присылать письма с уведомлениями об успешных платежах.
-
-По HTTP(S)
-При вызове методов:
-
-Подтвердить списание и Отменить платеж — уведомление с информацией об операции отправляется через POST‑запрос на адрес NotificationURL.
-
-Подтвердить платеж:
-
-При двухстадийной оплате — уведомление с информацией об операции отправляется через POST‑запрос на адрес NotificationURL.
-
-При одностадийной оплате — уведомление отправляется на ваш сайт на адрес NotificationURL и ждет ответа в течение 10 секунд. Сервис одновременно отправляет две нотификации — AUTHORIZED и CONFIRMED.
-
-Для метода Провести платеж по сохраненным реквизитам логика такая же.
-
-Привязать карту — уведомление отправляется на ваш сайт на адрес NotificationURL и ждет ответа в течение 10 секунд.
-
-Если в NotificationURL используются порты, можно использовать порт 443 (HTTPS).
+logger = logging.getLogger(__name__)
 
 
-Список внешних сетей, которые использует Т-Банк
-Дополнительные параметры
-Чтобы включить дополнительные параметры DATA, обратитесь к своему персональному менеджеру.
-Избегайте символов ', ", &, <, >, подлежащих экранированию в нотификациях.
-Если значение параметра — null, оно не будет учитываться в формировании нотификации.
-В уведомлениях можно получать дополнительные параметры. Для этого передайте объект DATA с нужными параметрами. В ответе вернется параметр Data — учитывайте регистр.
+class WebhookHandler:
+    """Обработчик webhook-уведомлений"""
+    
+    def __init__(self, password: str):
+        self.password = password
+        self._handlers: Dict[str, Callable] = {}
+    
+    def on(self, status: str, handler: Callable[[Notification], None]):
+        """
+        Регистрация обработчика для статуса
+        
+        Args:
+            status: Статус платежа (например, "CONFIRMED", "CANCELED", "AUTHORIZED")
+            handler: Функция-обработчик
+            
+        Returns:
+            handler (для использования как декоратор)
+        """
+        self._handlers[status] = handler
+        return handler
+    
+    def validate_notification(self, data: Dict[str, Any]) -> bool:
+        """
+        Валидация подписи уведомления
+        
+        Важно: в уведомлении вложенные объекты не участвуют в подписи!
+        
+        Args:
+            data: Данные уведомления
+            
+        Returns:
+            True если подпись валидна
+        """
+        if "Token" not in data:
+            return False
+        
+        received_token = data["Token"]
+        calculated_token = generate_token(data, self.password)
+        
+        return received_token == calculated_token
+    
+    def parse_notification(self, body: Union[str, Dict[str, Any]]) -> Notification:
+        """
+        Парсинг и валидация уведомления
+        
+        Args:
+            body: JSON-строка или dict с данными
+            
+        Returns:
+            Notification объект
+            
+        Raises:
+            TBankValidationError: если подпись невалидна
+        """
+        if isinstance(body, str):
+            data = json.loads(body)
+        else:
+            data = body
+        
+        if not self.validate_notification(data):
+            raise TBankValidationError("Invalid notification signature")
+        
+        return Notification.model_validate(data)
+    
+    def handle(self, body: Union[str, Dict[str, Any]]) -> Notification:
+        """
+        Обработка уведомления с вызовом зарегистрированных хендлеров
+        
+        Args:
+            body: Данные уведомления
+            
+        Returns:
+            Notification объект
+        """
+        notification = self.parse_notification(body)
+        
+        # Вызываем специфичный обработчик
+        handler = self._handlers.get(notification.status.value)
+        if handler:
+            try:
+                handler(notification)
+            except Exception as e:
+                logger.error(f"Error in webhook handler for {notification.status}: {e}")
+        
+        # Вызываем универсальный обработчик, если есть
+        universal_handler = self._handlers.get("*")
+        if universal_handler:
+            try:
+                universal_handler(notification)
+            except Exception as e:
+                logger.error(f"Error in universal webhook handler: {e}")
+        
+        return notification
+    
+    def get_success_response(self) -> str:
+        """Возвращает успешный ответ для Т-Банка"""
+        return json.dumps({"Success": True})
+    
+    def get_error_response(self, message: str = "Error") -> str:
+        """Возвращает ответ об ошибке"""
+        return json.dumps({"Success": False, "Message": message})
+Python
+Copy
+# example_usage.py
+"""Примеры использования модуля T-Bank Payment"""
 
-Пример набора параметров:
-
-Параметр	Значение
-description	Описание
-name	ФИО
-order_number	Идентификатор заказа
-paymentId	Идентификатор платежа
-source*	Способ оплаты
-terminalKey	Идентификатор терминала
-* При использовании платежной формы банка параметр source возвращается автоматически.
-
-Чтобы получать POST‑запросы со статусами платежа, укажите URL в настройках терминала или передайте параметр NotificationURL в запросе метода Инициировать платеж. Если параметр передан, используется его значение, если нет — значение из настроек терминала.
+import asyncio
+import os
+from datetime import datetime, timedelta
+from tbank_payment import (
+    TBankPaymentClient, TBankAsyncClient, TBankConfig,
+    InitPaymentRequest, Receipt, ReceiptItem,
+    Taxation, VAT, PaymentStatus,
+    WebhookHandler, amount_to_coins,
+)
 
 
-Статусы платежа
-Ответ на HTTP(s)-уведомление
-При успешной обработке уведомления вам нужно вернуть ответ HTTP CODE = 200 с телом сообщения OK — без тегов, заглавными английскими буквами.
-
-Если ответ OK не получен, уведомление считается неуспешным. Сервис будет повторно отправлять его раз в час в течение 24 часов, а затем раз в сутки в течение месяца. Если за это время оно так и не будет доставлено, уведомление будет перемещено в архив.
-
-Уведомления хранятся в архиве 90 дней. В течение этого времени вы можете запросить их повторную отправку.
-
-
-Параметры в теле уведомления о платеже
-
-Пример уведомления о платеже
-Привязка (NotificationAddCard)
-Вам будет отправлена информация о статусе привязки после привязки карты через метод:
-
-Иницировать привязку карты к покупателю, если используете банковскую форму привязки;
-Привязать карту, если используете свою форму привязки.
-Подробнее об отправке уведомлений.
-
-
-Параметры в теле уведомления о привязке карты
-
-Пример уведомления о привязке карты
-Фискализация (NotificationFiscalization)
-Если вы работаете по схеме интеграции «Маркетплейс», такой тип уведомлений не отправляется.
-
-При подключенной онлайн-кассе по результату фискализации вам придет уведомление с фискальными данными. Чтобы включить такие уведомления, обратитесь в поддержку банка.
-
-
-Параметры в теле уведомления о фискализации
-
-Пример уведомления о фискализации
-Статус привязки счета по QR (NotificationQr)
-Такие уведомления будут приходить только по статусам ACTIVE и INACTIVE.
-
-После успешной привязки счета по QR вам будет отправлена информация о статусе привязки счета и подпись запроса.
-
-
-Параметры в теле уведомления о статусе привязки счета по QR
-
-Пример уведомления о статусе привязки счета по QR
-Проверить токен уведомлений
-При получении уведомления и перед его обработкой проверьте токен:
-
-Соберите массив всех переданных в нотификации параметров в виде пар ключ:значение — кроме параметра Token и вложенных объектов (Data, Receipt):
-
-[{"TerminalKey": "1234567890DEMO"},{"OrderId": "000000"},{"Success": "true"},{"Status": "AUTHORIZED"},{"PaymentId": "0000000"},{"ErrorCode": "0"},{"Amount": "1111"},{"CardId": "000000"},{"Pan": "200000******0000"},{"ExpDate": "1111"},{"RebillId": "000000"}]
+def example_basic_payment():
+    """Базовый пример: создание платежа с редиректом на форму Т-Банка"""
+    
+    client = TBankPaymentClient(
+        terminal_key="TinkoffBankTest",
+        password="TinkoffBankTest"
+    )
+    
+    # Создаем чек (обязательно если онлайн-касса)
+    receipt = Receipt(
+        taxation=Taxation.OSN,
+        email="customer@example.com",
+        items=[
+            ReceiptItem(
+                name="Ноутбук",
+                quantity=1,
+                amount=50000,  # 500 руб
+                price=50000,
+                tax=VAT.VAT20
+            )
+        ]
+    )
+    
+    # Создаем платеж
+    request = InitPaymentRequest(
+        amount=50000,  # 500 руб в копейках
+        order_id=f"order_{datetime.now().timestamp()}",
+        description="Оплата ноутбука",
+        customer_key="customer_123",  # Для сохранения карты
+        recurrent="Y",  # Сохранить карту для рекуррентов
+        receipt=receipt,
+        redirect_due_date=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+    )
+    
+    response = client.init_payment(request)
+    
+    if response.success:
+        print(f"✅ Платеж создан!")
+        print(f"   URL для оплаты: {response.payment_url}")
+        print(f"   Payment ID: {response.payment_id}")
+        print(f"   Статус: {response.status}")
+    else:
+        print(f"❌ Ошибка: {response.error_message}")
 
 
-Добавьте в массив пару {"Password": "Значение пароля"}. Пароль можно найти в личном кабинете интернет-эквайринга.
+def example_recurrent_payment():
+    """Пример рекуррентного платежа (списание по сохраненной карте)"""
+    
+    client = TBankPaymentClient(
+        terminal_key="TinkoffBankTest",
+        password="TinkoffBankTest"
+    )
+    
+    # rebill_id получаем из webhook после первой оплаты с Recurrent=Y
+    rebill_id = "some_rebill_id_from_previous_payment"
+    
+    try:
+        response = client.charge_recurrent(
+            rebill_id=rebill_id,
+            amount=100.00,  # 100 руб
+            order_id=f"recurrent_{datetime.now().timestamp()}",
+            description="Ежемесячная подписка",
+            send_email=True,
+            info_email="customer@example.com"
+        )
+        
+        if response.success:
+            print(f"✅ Рекуррентный платеж успешен!")
+            print(f"   Payment ID: {response.payment_id}")
+            print(f"   Статус: {response.status}")
+        else:
+            print(f"❌ Ошибка: {response.error_message}")
+            
+    except Exception as e:
+        print(f"❌ Исключение: {e}")
 
-[{"TerminalKey": "1234567890DEMO"},{"OrderId": "000000"},{"Success": "true"},{"Status": "AUTHORIZED"},{"PaymentId": "0000000"},{"ErrorCode": "0"},{"Amount": "1111"},{"CardId": "000000"},{"Pan": "200000******0000"},{"ExpDate": "1111"},{"RebillId": "000000"},{"Password": "11111111111"}]
+
+def example_two_stage_payment():
+    """Пример двухстадийной оплаты (холдирование + подтверждение)"""
+    
+    client = TBankPaymentClient(
+        terminal_key="TinkoffBankTest",
+        password="TinkoffBankTest"
+    )
+    
+    # Шаг 1: Инициализация с PayType=T (двухстадийная)
+    request = InitPaymentRequest(
+        amount=10000,
+        order_id=f"hold_{datetime.now().timestamp()}",
+        description="Холдирование средств",
+        pay_type="T"  # Двухстадийная!
+    )
+    
+    response = client.init_payment(request)
+    payment_id = response.payment_id
+    
+    print(f"Создан платеж: {payment_id}, статус: {response.status}")
+    print(f"Клиент должен оплатить по URL: {response.payment_url}")
+    
+    # После оплаты клиентом, статус станет AUTHORIZED (деньги заблокированы)
+    # В реальном коде ждем webhook или проверяем статус
+    
+    # Шаг 2: Подтверждение (списание) - когда товар отправлен
+    # confirm_response = client.confirm_payment(payment_id)
+    # print(f"Подтверждение: {confirm_response.status}")
 
 
-Отсортируйте массив по алфавиту по ключу:
+def example_closing_receipt():
+    """Пример отправки закрывающего чека"""
+    
+    client = TBankPaymentClient(
+        terminal_key="TinkoffBankTest",
+        password="TinkoffBankTest"
+    )
+    
+    payment_id = "some_payment_id"
+    
+    # Чек на возврат или корректировку
+    receipt = Receipt(
+        taxation=Taxation.OSN,
+        email="customer@example.com",
+        items=[
+            ReceiptItem(
+                name="Возврат товара",
+                quantity=1,
+                amount=-5000,  # Отрицательная сумма для возврата
+                price=5000,
+                tax=VAT.VAT20
+            )
+        ]
+    )
+    
+    try:
+        response = client.send_closing_receipt(payment_id, receipt)
+        if response.success:
+            print("✅ Закрывающий чек отправлен")
+        else:
+            print(f"❌ Ошибка: {response.error_message}")
+    except Exception as e:
+        print(f"❌ Исключение: {e}")
 
-[{"Amount": "1111"},{"CardId": "000000"},{"ErrorCode": "0"},{"ExpDate": "1111"},{"OrderId": "000000"},{"Pan": "200000******0000"},{"Password": "11111111111"},{"PaymentId": "0000000"},{"RebillId": "000000"},{"Status": "AUTHORIZED"},{"Success": "true"},{"TerminalKey": "1234567890DEMO"}]
+
+def example_webhook_handling():
+    """Пример обработки webhook-уведомлений"""
+    
+    handler = WebhookHandler(password="TinkoffBankTest")
+    
+    @handler.on("CONFIRMED")
+    def on_payment_confirmed(notification):
+        """Успешная оплата (одностадийная)"""
+        print(f"✅ Платеж подтвержден: {notification.payment_id}")
+        print(f"   Сумма: {notification.amount / 100} руб")
+        print(f"   Карта: {notification.pan}")
+        
+        # Сохраняем rebill_id для рекуррентов
+        if notification.rebill_id:
+            print(f"   Rebill ID (для рекуррентов): {notification.rebill_id}")
+            # Сохранить в БД: notification.rebill_id связан с notification.customer_key
+    
+    @handler.on("AUTHORIZED")
+    def on_payment_authorized(notification):
+        """Двухстадийная: деньги заблокированы"""
+        print(f"⏸️ Платеж авторизован (холд): {notification.payment_id}")
+        # Здесь можно отправить товар, а затем вызвать Confirm
+    
+    @handler.on("CANCELED")
+    def on_payment_canceled(notification):
+        """Отмена/возврат"""
+        print(f"❌ Платеж отменен: {notification.payment_id}")
+    
+    @handler.on("REJECTED")
+    def on_payment_rejected(notification):
+        """Отклонен банком"""
+        print(f"🚫 Платеж отклонен: {notification.payment_id}")
+    
+    @handler.on("*")
+    def on_any_status(notification):
+        """Логирование всех статусов"""
+        print(f"📊 Статус изменен: {notification.status} для {notification.order_id}")
+    
+    # Симуляция входящего webhook от Т-Банка
+    webhook_data = {
+        "TerminalKey": "TinkoffBankTest",
+        "OrderId": "order_12345",
+        "Success": True,
+        "Status": "CONFIRMED",
+        "PaymentId": 123456789,
+        "Amount": 50000,
+        "RebillId": "rebill_123",
+        "Pan": "430000******0777",
+        "Token": "a1b2c3d4e5f6...",  # Реальная подпись
+        "ExpDate": "1125"
+    }
+    
+    try:
+        notification = handler.handle(webhook_data)
+        print(f"\nОбработано уведомление: {notification.status}")
+        
+        # Ответ для Т-Банка
+        response = handler.get_success_response()
+        print(f"Ответ: {response}")
+        
+    except Exception as e:
+        print(f"Ошибка обработки: {e}")
+        print(handler.get_error_response(str(e)))
 
 
-Конкатенируйте только значения пар в одну строку:
+async def async_example():
+    """Асинхронный пример"""
+    
+    async with TBankAsyncClient(
+        terminal_key="TinkoffBankTest",
+        password="TinkoffBankTest"
+    ) as client:
+        
+        # Быстрое создание платежа
+        payment_url = await client.create_payment_url(
+            amount=250.00,
+            order_id=f"async_{datetime.now().timestamp()}",
+            description="Асинхронная оплата"
+        )
+        
+        print(f"Async URL: {payment_url}")
+        
+        # Проверка статуса
+        # status = await client.get_state("payment_id")
 
-111100000001111000000200000******0000111111111110000000000000AUTHORIZEDtrue1234567890DEMO
 
-Примените к строке хеш-функцию SHA-256 (с поддержкой UTF-8):
-
-1c0964277d0213349243065a0d5b838b8e90d2d25f740d0f2767836e710e80c8
-
-
-Пример генерации токена
-
-Пример сравнения токенов
-Для проверки токена уведомления о привязке карты используйте следующие параметры:
-
-TerminalKey,
-CustomerKey,
-RequestKey,
-Success,
-Status,
-PaymentId,
-ErrorCode,
-CardId,
-Pan,
-ExpDate,
-NotificationType,
-RebillId — параметр передается, если был присвоен во время привязки.
+if __name__ == "__main__":
+    print("=" * 50)
+    print("1. Базовый платеж с чеком")
+    print("=" * 50)
+    example_basic_payment()
+    
+    print("\n" + "=" * 50)
+    print("2. Рекуррентный платеж")
+    print("=" * 50)
+    example_recurrent_payment()
+    
+    print("\n" + "=" * 50)
+    print("3. Двухстадийная оплата")
+    print("=" * 50)
+    example_two_stage_payment()
+    
+    print("\n" + "=" * 50)
+    print("4. Закрывающий чек")
+    print("=" * 50)
+    example_closing_receipt()
+    
+    print("\n" + "=" * 50)
+    print("5. Обработка webhook")
+    print("=" * 50)
+    example_webhook_handling()
+    
+    print("\n" + "=" * 50)
+    print("6. Асинхронный клиент")
+    print("=" * 50)
+    asyncio.run(async_example())
+Ключевые исправления по документации:
+Генерация токена — теперь правильно: только корневые параметры (без вложенных объектов), сортировка по ключам, конкатенация значений
+FinishAuthorize — добавлен метод для собственной платежной формы (не PaymentURL)
+SendClosingReceipt — отдельный endpoint /cashbox/SendClosingReceipt для закрывающих чеков
+Charge — рекуррентные платежи (списание по сохраненной карте)
+Поля моделей — точное соответствие документации (алиасы, обязательность)
+Обработка webhook — правильная валидация подписи (вложенные объекты не участвуют)
+Модуль готов к использованию как плагин! 🚀

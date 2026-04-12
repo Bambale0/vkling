@@ -21,7 +21,9 @@ from vkbottle.callback import BotCallback
 from vkbottle.dispatch.rules.base import ABCRule, CommandRule, PayloadRule
 from vkbottle.tools import DocMessagesUploader, PhotoMessageUploader
 
-from tbank import TBankAPI
+from tbank_payment.client import TBankPaymentClient as TBankAPI
+from tbank_payment.models import InitPaymentRequest
+from tbank_payment.utils import generate_token
 
 
 class TextExistsRule(ABCRule):
@@ -145,7 +147,8 @@ logging.basicConfig(
 )
 
 # Set tbank logger to DEBUG
-logging.getLogger("tbank").setLevel(logging.DEBUG)
+logging.getLogger("tbank_payment").setLevel(logging.DEBUG)
+
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -1667,6 +1670,123 @@ class Keyboards:
         return json.dumps({"inline": True, "buttons": buttons})
 
     @staticmethod
+    def kling_config_kb(data: dict = None):
+        data = data or {}
+        kling_sound = data.get("kling_sound", True)
+
+        def get_color(selected):
+            return "primary" if selected else "secondary"
+
+        buttons = [
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "🔊 Звук: Вкл",
+                        "payload": {"cmd": "kling_param", "kling_sound": True},
+                    },
+                    "color": get_color(kling_sound),
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "🔇 Звук: Выкл",
+                        "payload": {"cmd": "kling_param", "kling_sound": False},
+                    },
+                    "color": get_color(not kling_sound),
+                },
+            ],
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "✅ Готово к промпту",
+                        "payload": {"cmd": "kling_ready"},
+                    }
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "⬅️ Модели",
+                        "payload": {"cmd": "ref_models"},
+                    }
+                },
+            ],
+        ]
+        return json.dumps({"inline": True, "buttons": buttons})
+
+    @staticmethod
+    def seedance_config_kb(data: dict = None):
+        data = data or {}
+        resolution = data.get("seedance_resolution", "720p")
+        generate_audio = data.get("seedance_audio", True)
+
+        def get_color(selected):
+            return "primary" if selected else "secondary"
+
+        buttons = [
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "480p",
+                        "payload": {
+                            "cmd": "seedance_param",
+                            "seedance_resolution": "480p",
+                        },
+                    },
+                    "color": get_color(resolution == "480p"),
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "720p",
+                        "payload": {
+                            "cmd": "seedance_param",
+                            "seedance_resolution": "720p",
+                        },
+                    },
+                    "color": get_color(resolution == "720p"),
+                },
+            ],
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "🔊 Аудио: Вкл",
+                        "payload": {"cmd": "seedance_param", "seedance_audio": True},
+                    },
+                    "color": get_color(generate_audio),
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "🔇 Аудио: Выкл",
+                        "payload": {"cmd": "seedance_param", "seedance_audio": False},
+                    },
+                    "color": get_color(not generate_audio),
+                },
+            ],
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "✅ Готово к промпту",
+                        "payload": {"cmd": "seedance_ready"},
+                    }
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "⬅️ Модели",
+                        "payload": {"cmd": "ref_models"},
+                    }
+                },
+            ],
+        ]
+        return json.dumps({"inline": True, "buttons": buttons})
+
+    @staticmethod
     def video_models_list():
         return json.dumps(
             {
@@ -1804,11 +1924,12 @@ class BananaBoomBot:
         self.api_client = AIAPIClient()
         self.tbank = (
             TBankAPI(
-                Config.TBANK_TERMINAL_KEY, Config.TBANK_SECRET_KEY, Config.TBANK_API_URL
+                terminal_key=Config.TBANK_TERMINAL_KEY, password=Config.TBANK_SECRET_KEY
             )
             if Config.TBANK_TERMINAL_KEY
             else None
         )
+
         self.confirmation_code = None
         self.secret_key = None
         self._setup_handlers()
@@ -2500,20 +2621,22 @@ class BananaBoomBot:
             self.db.create_pending_payment(user_id, order_id, rub)
 
             desc = f"Пополнение {bananas} 🍌"
-            result = self.tbank.init_payment(
-                amount=rub * 100,
-                order_id=order_id,
-                description=desc,
-                notification_url=f"{Config.WEBHOOK_HOST}/webhook/tbank",
-                success_url=f"{Config.WEBHOOK_HOST}/pay_success?order_id={order_id}",
-                fail_url=f"{Config.WEBHOOK_HOST}/pay_fail?order_id={order_id}",
+            request = InitPaymentRequest(
+                Amount=rub * 100,
+                OrderId=order_id,
+                Description=desc,
+                NotificationURL=f"{Config.WEBHOOK_HOST}/webhook/tbank",
+                SuccessURL=f"{Config.WEBHOOK_HOST}/pay_success?order_id={order_id}",
+                FailURL=f"{Config.WEBHOOK_HOST}/pay_fail?order_id={order_id}",
             )
+            result = self.tbank.init_payment(request)
 
-            if result and result.get("Success"):
-                payment_url = result["PaymentURL"]
+            if result.success:
+                payment_url = result.payment_url
                 self.db.update_payment_tbank_id(
-                    self.db.get_payment_by_order_id(order_id)["id"], result["PaymentId"]
+                    self.db.get_payment_by_order_id(order_id)["id"], result.payment_id
                 )
+
                 await message.answer(
                     f"💳 Оплата {rub} ₽ за {bananas} 🍌\n\n[Перейти к оплате]({payment_url})\n\nПосле оплаты баланс обновится автоматически.",
                     parse_mode="Markdown",
@@ -2618,19 +2741,22 @@ class BananaBoomBot:
                 keyboard=Keyboards.ref_combined_kb(data),
             )
             if all(k in data for k in ["ref_model", "aspect", "duration"]):
+                ref_model = data["ref_model"]
                 cost = Config.PRICES.get(f"video_{data['model']}", 15)
-                model_label = data["model"].upper()
-                if data.get("kling_mode"):
-                    model_label += f" {data['kling_mode'].upper()}"
-                if data.get("ref_model") == "grok":
+                if ref_model == "grok":
                     await message.answer(
                         "🤖 Grok настройки видео:",
                         keyboard=Keyboards.grok_img_keyboard(data),
                     )
-                else:
+                elif ref_model == "kling3":
                     await message.answer(
-                        f"✅ Конфиг готов: {model_label} {data['aspect']} {data['duration']}s ({cost}🍌)\n\n📝 Введите промпт для генерации:",
-                        keyboard=Keyboards.regular_back("main_menu"),
+                        "⚡ Kling настройки видео:",
+                        keyboard=Keyboards.kling_config_kb(data),
+                    )
+                elif ref_model == "seedance2":
+                    await message.answer(
+                        "🌿 Seedance2 настройки видео:",
+                        keyboard=Keyboards.seedance_config_kb(data),
                     )
 
         @bot.on.message(
@@ -2647,19 +2773,22 @@ class BananaBoomBot:
                 keyboard=Keyboards.ref_combined_kb(data),
             )
             if all(k in data for k in ["ref_model", "aspect", "duration"]):
+                ref_model = data["ref_model"]
                 cost = Config.PRICES.get(f"video_{data['model']}", 15)
-                model_label = data["model"].upper()
-                if data.get("kling_mode"):
-                    model_label += f" {data['kling_mode'].upper()}"
-                if data.get("ref_model") == "grok":
+                if ref_model == "grok":
                     await message.answer(
                         "🤖 Grok настройки видео:",
                         keyboard=Keyboards.grok_img_keyboard(data),
                     )
-                else:
+                elif ref_model == "kling3":
                     await message.answer(
-                        f"✅ Конфиг готов: {model_label} {data['aspect']} {data['duration']}s ({cost}🍌)\n\n📝 Введите промпт для генерации:",
-                        keyboard=Keyboards.regular_back("main_menu"),
+                        "⚡ Kling настройки видео:",
+                        keyboard=Keyboards.kling_config_kb(data),
+                    )
+                elif ref_model == "seedance2":
+                    await message.answer(
+                        "🌿 Seedance2 настройки видео:",
+                        keyboard=Keyboards.seedance_config_kb(data),
                     )
 
         @bot.on.message(
@@ -2676,26 +2805,29 @@ class BananaBoomBot:
                 keyboard=Keyboards.ref_combined_kb(data),
             )
             if all(k in data for k in ["ref_model", "aspect", "duration"]):
+                ref_model = data["ref_model"]
                 cost = Config.PRICES.get(f"video_{data['model']}", 15)
-                model_label = data["model"].upper()
-                if data.get("kling_mode"):
-                    model_label += f" {data['kling_mode'].upper()}"
-                if data.get("ref_model") == "grok":
+                if ref_model == "grok":
                     await message.answer(
                         "🤖 Grok настройки видео:",
                         keyboard=Keyboards.grok_img_keyboard(data),
                     )
-                else:
+                elif ref_model == "kling3":
                     await message.answer(
-                        f"✅ Конфиг готов: {model_label} {data['aspect']} {data['duration']}s ({cost}🍌)\n\n📝 Введите промпт для генерации:",
-                        keyboard=Keyboards.regular_back("main_menu"),
+                        "⚡ Kling настройки видео:",
+                        keyboard=Keyboards.kling_config_kb(data),
+                    )
+                elif ref_model == "seedance2":
+                    await message.answer(
+                        "🌿 Seedance2 настройки видео:",
+                        keyboard=Keyboards.seedance_config_kb(data),
                     )
 
         @bot.on.message(
             PayloadContainsRule("cmd"),
             DBStateRule(self.db, UserState.REF_VIDEO_CONFIG.value),
         )
-        async def grok_config_handler(message: Message):
+        async def ref_config_handler(message: Message):
             try:
                 payload_dict = json.loads(message.payload or "{}")
                 cmd = payload_dict.get("cmd")
@@ -2703,6 +2835,8 @@ class BananaBoomBot:
             except:
                 return
             state, data = self.db.get_state(message.from_id)
+
+            ref_model = data.get("ref_model")
 
             if cmd == "grok_param":
                 if "grok_mode" in payload:
@@ -2720,19 +2854,75 @@ class BananaBoomBot:
 
             if cmd == "grok_ready":
                 required = ["ref_model", "aspect", "duration"]
-                if data.get("ref_model") != "grok" or not all(
-                    k in data for k in required
-                ):
+                if ref_model != "grok" or not all(k in data for k in required):
                     await message.answer(
                         "⚠️ Выберите модель Grok, aspect и duration сначала!",
                         keyboard=Keyboards.grok_img_keyboard(data),
                     )
                     return
-                cost = Config.PRICES["video_grok_img2video"]
+                cost = Config.PRICES.get("video_grok_img2video", 20)
                 mode = data.get("grok_mode", "normal")
                 res = data.get("grok_resolution", "720p")
                 await message.answer(
-                    f"✅ Grok Img2Video {data['aspect']} {data['duration']}s {mode} {res} (18🍌)\n\n📝 Введите промпт:",
+                    f"✅ Grok Img2Video {data['aspect']} {data['duration']}s {mode} {res} ({cost}🍌)\n\n📝 Введите промпт:",
+                    keyboard=Keyboards.regular_back("main_menu"),
+                )
+                return
+
+            if cmd == "kling_param":
+                if "kling_sound" in payload:
+                    data["kling_sound"] = payload["kling_sound"]
+                self.db.set_state(message.from_id, state, data)
+                sound_str = "Вкл" if data.get("kling_sound", True) else "Выкл"
+                await message.answer(
+                    f"⚡ Kling 3.0\nЗвук: {sound_str}\n\nВыберите:",
+                    keyboard=Keyboards.kling_config_kb(data),
+                )
+                return
+
+            if cmd == "kling_ready":
+                required = ["ref_model", "aspect", "duration"]
+                if ref_model != "kling3" or not all(k in data for k in required):
+                    await message.answer(
+                        "⚠️ Выберите Kling, aspect и duration сначала!",
+                        keyboard=Keyboards.kling_config_kb(data),
+                    )
+                    return
+                cost = Config.PRICES.get("video_kling3", 15)
+                sound_str = "Вкл" if data.get("kling_sound", True) else "Выкл"
+                await message.answer(
+                    f"✅ Kling {data['aspect']} {data['duration']}s Звук: {sound_str} ({cost}🍌)\n\n📝 Введите промпт:",
+                    keyboard=Keyboards.regular_back("main_menu"),
+                )
+                return
+
+            if cmd == "seedance_param":
+                if "seedance_resolution" in payload:
+                    data["seedance_resolution"] = payload["seedance_resolution"]
+                if "seedance_audio" in payload:
+                    data["seedance_audio"] = payload["seedance_audio"]
+                self.db.set_state(message.from_id, state, data)
+                res = data.get("seedance_resolution", "720p")
+                audio_str = "Вкл" if data.get("seedance_audio", True) else "Выкл"
+                await message.answer(
+                    f"🌿 Seedance2\nResolution: {res}\nАудио: {audio_str}\n\nВыберите:",
+                    keyboard=Keyboards.seedance_config_kb(data),
+                )
+                return
+
+            if cmd == "seedance_ready":
+                required = ["ref_model", "aspect", "duration"]
+                if ref_model != "seedance2" or not all(k in data for k in required):
+                    await message.answer(
+                        "⚠️ Выберите Seedance2, aspect и duration сначала!",
+                        keyboard=Keyboards.seedance_config_kb(data),
+                    )
+                    return
+                cost = Config.PRICES.get("video_seedance2", 17)
+                res = data.get("seedance_resolution", "720p")
+                audio_str = "Вкл" if data.get("seedance_audio", True) else "Выкл"
+                await message.answer(
+                    f"✅ Seedance2 {data['aspect']} {data['duration']}s {res} Аудио: {audio_str} ({cost}🍌)\n\n📝 Введите промпт:",
                     keyboard=Keyboards.regular_back("main_menu"),
                 )
                 return
@@ -2753,12 +2943,13 @@ class BananaBoomBot:
             if not all(k in data for k in required):
                 await message.answer(
                     "⚠️ Сначала выберите все параметры (модель, соотношение, длительность)!",
-                    keyboard=Keyboards.ref_combined_kb(),
+                    keyboard=Keyboards.ref_combined_kb(data),
                 )
                 return
 
             user_prompt = message.text
             model = data["model"]
+            ref_model = data["ref_model"]
             cost = Config.PRICES.get(f"video_{model}", 15)
             user_id = message.from_id
             user = self.db.get_or_create_user(user_id)
@@ -2776,9 +2967,17 @@ class BananaBoomBot:
                 "duration": data["duration"],
                 "refs": data["refs"],
             }
-            if model == "grok":
+            if ref_model == "grok":
                 task_data["grok_mode"] = data.get("grok_mode", "normal")
                 task_data["grok_resolution"] = data.get("grok_resolution", "720p")
+            elif ref_model == "kling3":
+                task_data["kling_mode"] = data.get("kling_mode", "std")
+                task_data["kling_sound"] = data.get("kling_sound", True)
+            elif ref_model == "seedance2":
+                task_data["seedance_resolution"] = data.get(
+                    "seedance_resolution", "720p"
+                )
+                task_data["seedance_audio"] = data.get("seedance_audio", True)
             task_id = self.db.create_task(
                 user_id, "ref_video", model, json.dumps(task_data), cost
             )
@@ -3021,7 +3220,8 @@ class BananaBoomBot:
             duration = data["duration"]
             refs = data["refs"]
             self.db.update_task_status(task_id, "processing")
-            if model == "grok":
+            ref_model = data.get("ref_model", model)
+            if ref_model == "grok":
                 api_key = Config.KLING_API_KEY
                 kie_model = "grok-imagine/image-to-video"
                 input_data = {
@@ -3033,21 +3233,22 @@ class BananaBoomBot:
                     "resolution": data.get("grok_resolution", "720p"),
                     "nsfw_checker": False,
                 }
-            elif model == "kling3":
+            elif ref_model == "kling3":
                 api_key = Config.KLING_API_KEY
                 kie_model = "kling-3.0/video"
                 kling_mode = data.get("kling_mode", "std")
+                kling_sound = data.get("kling_sound", True)
                 image_urls = refs[:2] if len(refs) >= 2 else (refs[:1] if refs else [])
                 input_data = {
                     "prompt": user_prompt,
                     "image_urls": image_urls,
-                    "sound": True,
+                    "sound": kling_sound,
                     "duration": str(duration),
                     "aspect_ratio": aspect,
                     "mode": kling_mode,
                     "multi_shots": False,
                 }
-            elif model == "seedance2":
+            elif ref_model == "seedance2":
                 api_key = Config.KLING_API_KEY
                 kie_model = "bytedance/seedance-2"
                 input_data = {
@@ -3055,8 +3256,8 @@ class BananaBoomBot:
                     "reference_image_urls": refs[:9],
                     "aspect_ratio": aspect,
                     "duration": duration,
-                    "resolution": "720p",
-                    "generate_audio": True,
+                    "resolution": data.get("seedance_resolution", "720p"),
+                    "generate_audio": data.get("seedance_audio", True),
                     "nsfw_checker": False,
                 }
             else:
@@ -3081,43 +3282,16 @@ class BananaBoomBot:
                 if not received_token:
                     raise ValueError("No Token in notification")
 
-                # Fields to ignore for webhook signature
-                ignored_fields = {"Token", "Data", "Receipt", "Shops"}
-
-                # Collect scalar values only
-                token_params = {}
-                for key, value in data.items():
-                    if key in ignored_fields:
-                        continue
-                    if isinstance(value, (str, int, float, bool)):
-                        token_params[key] = (
-                            "true"
-                            if isinstance(value, bool) and value
-                            else "false" if isinstance(value, bool) else str(value)
-                        )
-
-                # Sort keys alphabetically
-                sorted_keys = sorted(token_params.keys())
-
-                # Concat values + secret_key at end (NO "Password" key for webhooks)
-                values_str = (
-                    "".join(token_params[k] for k in sorted_keys)
-                    + Config.TBANK_SECRET_KEY
-                )
-
-                logging.debug(f"Webhook token string: {repr(values_str)}")
-
-                expected_token = hashlib.sha256(values_str.encode("utf-8")).hexdigest()
+                calculated_token = generate_token(data, Config.TBANK_SECRET_KEY)
 
                 if data.get("TerminalKey", "").endswith("DEMO"):
                     logging.debug(
                         f"DEMO TBank token mismatch ignored for {data.get('OrderId')}"
                     )
-                elif not hmac.compare_digest(expected_token, received_token):
+                elif received_token != calculated_token:
                     logging.error(
-                        f"TBank webhook token invalid. Expected: {expected_token}, Got: {received_token}"
+                        f"TBank webhook token invalid. Expected: {calculated_token}, Got: {received_token}"
                     )
-                    logging.error(f"Token params keys: {sorted_keys}")
                     raise ValueError("Invalid webhook token")
             else:
                 logging.info("TBank token validation skipped (test mode)")
