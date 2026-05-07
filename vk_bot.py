@@ -25,6 +25,8 @@ from tbank_payment.client import TBankPaymentClient as TBankAPI
 from tbank_payment.models import InitPaymentRequest
 from tbank_payment.utils import generate_token
 
+# from admin_panel import run_admin_panel
+
 
 class TextExistsRule(ABCRule):
 
@@ -457,6 +459,39 @@ class Database:
             }
         return None
 
+    def block_user(self, user_id: int, is_blocked: bool, reason: str = None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET is_blocked = ?, block_reason = ? WHERE user_id = ?",
+            (is_blocked, reason, user_id),
+        )
+        conn.commit()
+        conn.close()
+        return cursor.rowcount > 0
+
+    def get_users_paginated(self, page: int = 0, per_page: int = 10):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        offset = page * per_page
+        cursor.execute(
+            "SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        users = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "user_id": u[0],
+                "balance": u[1],
+                "created_at": u[2],
+                "last_activity": u[3],
+                "is_blocked": u[4],
+                "block_reason": u[5],
+            }
+            for u in users
+        ], self.get_connection().execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
 
 # ==================== СОСТОЯНИЯ БОТА ====================
 
@@ -479,9 +514,19 @@ class UserState(Enum):
     PHOTO_WAITING_ASPECT = "photo_waiting_aspect"
     VIDEO_WAITING_MODEL = "video_waiting_model"
     VIDEO_WAITING_ASPECT = "video_waiting_aspect"
+    BROADCAST_TEXT = "broadcast_text"
+    BROADCAST_PHOTO = "broadcast_photo"
+    BROADCAST_PREVIEW = "broadcast_preview"
 
+    # ==================== API КЛИЕНТЫ ====================
 
-# ==================== API КЛИЕНТЫ ====================
+    async def run_admin_server(self):
+        """Запуск админ-панели в отдельном процессе"""
+        import multiprocessing
+
+        admin_process = multiprocessing.Process(target=run_admin_panel)
+        admin_process.start()
+        logging.info("Админ-панель запущена на порту 5000")
 
 
 class AIAPIClient:
@@ -1916,8 +1961,146 @@ class Keyboards:
             }
         )
 
+    @staticmethod
+    def admin_menu(data=None):
+        return json.dumps(
+            {
+                "inline": True,
+                "buttons": [
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "👥 Пользователи",
+                                "payload": {"cmd": "admin_users"},
+                            }
+                        },
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "📋 Задачи",
+                                "payload": {"cmd": "admin_tasks"},
+                            }
+                        },
+                    ],
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "💳 Транзакции",
+                                "payload": {"cmd": "admin_transactions"},
+                            }
+                        },
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "💵 Платежи",
+                                "payload": {"cmd": "admin_payments"},
+                            }
+                        },
+                    ],
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "📢 Рассылка",
+                                "payload": {"cmd": "admin_broadcast"},
+                            }
+                        },
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "📊 Статистика",
+                                "payload": {"cmd": "admin_stats"},
+                            }
+                        },
+                    ],
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "⬅️ Назад",
+                                "payload": {"cmd": "main_menu"},
+                            }
+                        }
+                    ],
+                ],
+            }
+        )
+
+    @staticmethod
+    def broadcast_keyboard():
+        return json.dumps(
+            {
+                "inline": True,
+                "buttons": [
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "📸 Добавить фото",
+                                "payload": {"action": "add_photo"},
+                            }
+                        },
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "✅ Предпросмотр",
+                                "payload": {"action": "preview"},
+                            }
+                        },
+                    ],
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "⬅️ Отмена",
+                                "payload": {"cmd": "admin_menu"},
+                            }
+                        }
+                    ],
+                ],
+            }
+        )
+
+    @staticmethod
+    def broadcast_preview_keyboard():
+        return json.dumps(
+            {
+                "inline": True,
+                "buttons": [
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "🚀 Отправить всем",
+                                "payload": {"action": "send_broadcast"},
+                            }
+                        },
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "✏️ Изменить",
+                                "payload": {"action": "edit_broadcast"},
+                            }
+                        },
+                    ],
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": "❌ Отмена",
+                                "payload": {"cmd": "admin_menu"},
+                            }
+                        }
+                    ],
+                ],
+            }
+        )
+
 
 class BananaBoomBot:
+
     def __init__(self):
         self.bot = Bot(Config.VK_TOKEN)
         self.db = Database()
@@ -1965,16 +2148,69 @@ class BananaBoomBot:
         bot = self.bot
 
         @bot.on.message(CommandRule("start"))
-        @bot.on.message(PayloadRule({"cmd": "main_menu"}))
-        async def main_menu_handler(message: Message):
+        @bot.on.message(CommandRule("admin"))
+        async def admin_handler(message: Message):
             user = self.db.get_or_create_user(message.from_id)
+            if user["user_id"] != Config.ADMIN_ID:
+                await message.answer(
+                    "⛔ Доступ запрещён. Эта команда только для админа."
+                )
+                return
             if user["is_blocked"]:
                 await message.answer(
                     f"⛔ Ваш аккаунт заблокирован.\nПричина: {user['block_reason']}"
                 )
                 return
-            text = f"🍌 Banana Boom — создавай с AI!\n\n✅ Генерация артов: Пиши промпт — получай шедевр\n✅ Видео-продакшн: Делаю ролики из слов и фото\n\n🍌 Ваш баланс: {user['balance']} 🍌\n\n⚠️ Неприемлемый контент запрещён.\n\n👇 Попробуй!"
-            await message.answer(text, keyboard=Keyboards.main_menu())
+            # Статистика
+            total_users = (
+                self.db.get_connection()
+                .execute("SELECT COUNT(*) FROM users")
+                .fetchone()[0]
+            )
+            active_users = self.db.get_connection().execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE last_activity >= datetime('now', '-7 days')
+            """).fetchone()[0]
+            blocked_users = (
+                self.db.get_connection()
+                .execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
+                .fetchone()[0]
+            )
+            total_tasks = (
+                self.db.get_connection()
+                .execute("SELECT COUNT(*) FROM generation_tasks")
+                .fetchone()[0]
+            )
+            completed_tasks = (
+                self.db.get_connection()
+                .execute(
+                    "SELECT COUNT(*) FROM generation_tasks WHERE status = 'completed'"
+                )
+                .fetchone()[0]
+            )
+            total_balance = (
+                self.db.get_connection()
+                .execute("SELECT COALESCE(SUM(balance), 0) FROM users")
+                .fetchone()[0]
+            )
+            total_transactions = (
+                self.db.get_connection()
+                .execute("SELECT COUNT(*) FROM transactions")
+                .fetchone()[0]
+            )
+
+            text = f"📊 Админ-панель Banana Boom\n\n"
+            text += f"👥 Всего пользователей: {total_users}\n"
+            text += f"🟢 Активных (7 дн): {active_users}\n"
+            text += f"🔴 Заблокировано: {blocked_users}\n"
+            text += f"📋 Всего задач: {total_tasks}\n"
+            text += f"✅ Выполнено: {completed_tasks}\n"
+            text += f"💰 Баланс (🍌): {total_balance}\n"
+            text += f"💳 Транзакции: {total_transactions}\n\n"
+            text += f"👇 Доступные действия:"
+
+            await message.answer(text, keyboard=Keyboards.admin_menu(data=None))
+
             self.db.clear_state(message.from_id)
 
         @bot.on.message(PayloadRule({"cmd": "create_video"}))
@@ -2601,6 +2837,575 @@ class BananaBoomBot:
                 f"🔧 Поддержка\n\n@support_manager\n\nКанал: @banana_boom_channel",
                 keyboard=Keyboards.main_menu(),
             )
+
+        @bot.on.message(PayloadRule({"cmd": "admin_users"}))
+        async def admin_users_handler(message: Message):
+            try:
+                payload = json.loads(message.payload or "{}")
+                page = payload.get("page", 0)
+            except:
+                page = 0
+
+            users, total = self.db.get_users_paginated(page)
+            text = f"👥 Пользователи (страница {page + 1})\nВсего: {total}\n\n"
+            buttons = []
+
+            for user in users:
+                status = "🟢 Активен" if not user["is_blocked"] else f"🔴 Заблокирован"
+                text += f"👤 ID: {user['user_id']}\n"
+                text += f"💰 Баланс: {user['balance']} 🍌\n"
+                text += f"📅 Рег: {user['created_at'][:10]}\n\n"
+
+                action = "unblock" if user["is_blocked"] else "block"
+                buttons.append(
+                    [
+                        {
+                            "action": {
+                                "type": "text",
+                                "label": f"{'Разблок' if user['is_blocked'] else 'Блок'} {user['user_id']}",
+                                "payload": json.dumps(
+                                    {
+                                        "cmd": "admin_block",
+                                        "user_id": user["user_id"],
+                                        "action": action,
+                                    }
+                                ),
+                            }
+                        }
+                    ]
+                )
+
+            # Пагинация
+            pagination_buttons = []
+            if page > 0:
+                pagination_buttons.append(
+                    {
+                        "action": {
+                            "type": "text",
+                            "label": "⬅️ Пред",
+                            "payload": json.dumps(
+                                {"cmd": "admin_users", "page": page - 1}
+                            ),
+                        }
+                    }
+                )
+            if (page + 1) * 10 < total:
+                pagination_buttons.append(
+                    {
+                        "action": {
+                            "type": "text",
+                            "label": "След ➡️",
+                            "payload": json.dumps(
+                                {"cmd": "admin_users", "page": page + 1}
+                            ),
+                        }
+                    }
+                )
+
+            if pagination_buttons:
+                buttons.append(pagination_buttons)
+
+            buttons.append(
+                [
+                    {
+                        "action": {
+                            "type": "text",
+                            "label": "⬅️ Назад",
+                            "payload": {"cmd": "admin_menu"},
+                        }
+                    }
+                ]
+            )
+
+            kb = json.dumps({"inline": True, "buttons": buttons})
+            await message.answer(text, keyboard=kb)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_block"}))
+        async def admin_block_handler(message: Message):
+            try:
+                payload = json.loads(message.payload)
+                user_id = int(payload["user_id"])
+                action = payload["action"]
+            except:
+                await message.answer("❌ Неверные данные.")
+                return
+
+            is_blocked = action == "block"
+            reason = "Админ заблокировал" if is_blocked else None
+            success = self.db.block_user(user_id, is_blocked, reason)
+
+            if success:
+                status = "заблокирован" if is_blocked else "разблокирован"
+                await message.answer(f"✅ Пользователь {user_id} {status}!")
+            else:
+                await message.answer(
+                    f"❌ Ошибка при изменении статуса пользователя {user_id}"
+                )
+
+            # Вернуться к списку пользователей
+            await admin_users_handler(message)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_tasks"}))
+        async def admin_tasks_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM generation_tasks ORDER BY created_at DESC LIMIT 20"
+            )
+            tasks = cursor.fetchall()
+            conn.close()
+            task_list = []
+            for task in tasks:
+                task_list.append(
+                    {
+                        "task_id": task[0],
+                        "user_id": task[1],
+                        "task_type": task[2],
+                        "model": task[3],
+                        "status": task[5],
+                        "cost": task[6],
+                        "created_at": task[7],
+                    }
+                )
+            text = f"📋 Задачи (последние 20)\n\n"
+            for task in task_list:
+                status_icon = {
+                    "completed": "✅",
+                    "processing": "⏳",
+                    "failed": "❌",
+                    "pending": "⌛",
+                }.get(task["status"], "❓")
+                text += (
+                    f"{status_icon} Задача #{task['task_id']} ({task['task_type']})\n"
+                )
+                text += f"👤 Пользователь: {task['user_id']}\n"
+                text += f"⚙️ Модель: {task['model']}\n"
+                text += f"💰 Стоимость: {task['cost']} 🍌\n"
+                text += f"📅 Дата: {task['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_transactions"}))
+        async def admin_transactions_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM transactions ORDER BY created_at DESC LIMIT 15"
+            )
+            transactions = cursor.fetchall()
+            conn.close()
+            trans_list = []
+            for trans in transactions:
+                trans_list.append(
+                    {
+                        "transaction_id": trans[0],
+                        "user_id": trans[1],
+                        "amount": trans[2],
+                        "reason": trans[3],
+                        "created_at": trans[4],
+                    }
+                )
+            text = f"💳 Транзакции (последние 15)\n\n"
+            for trans in trans_list:
+                sign = "➕" if trans["amount"] > 0 else "➖"
+                text += f"{sign} {abs(trans['amount'])} 🍌\n"
+                text += f"👤 Пользователь: {trans['user_id']}\n"
+                text += f"📝 Причина: {trans['reason']}\n"
+                text += f"📅 Дата: {trans['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_payments"}))
+        async def admin_payments_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT 10")
+            payments = cursor.fetchall()
+            conn.close()
+            pay_list = []
+            for pay in payments:
+                pay_list.append(
+                    {
+                        "id": pay[0],
+                        "user_id": pay[1],
+                        "amount_rub": pay[4],
+                        "status": pay[5],
+                        "created_at": pay[6],
+                    }
+                )
+            text = f"💵 Платежи (последние 10)\n\n"
+            for pay in pay_list:
+                status_icon = {"confirmed": "✅", "pending": "⏳", "failed": "❌"}.get(
+                    pay["status"], "❓"
+                )
+                text += f"{status_icon} {pay['amount_rub']} ₽\n"
+                text += f"👤 Пользователь: {pay['user_id']}\n"
+                text += f"🏷️ Статус: {pay['status']}\n"
+                text += f"📅 Дата: {pay['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_broadcast"}))
+        async def admin_broadcast_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            kb = Keyboards.broadcast_keyboard()
+            await message.answer("📢 Рассылка\n\nВведите текст сообщения:", keyboard=kb)
+            self.db.set_state(message.from_id, UserState.BROADCAST_TEXT.value, {})
+
+        @bot.on.message(
+            DBStateRule(self.db, UserState.BROADCAST_TEXT.value), TextExistsRule()
+        )
+        async def broadcast_text_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            state_data = self.db.get_state(message.from_id)[1]
+            state_data["text"] = message.text
+            self.db.set_state(
+                message.from_id, UserState.BROADCAST_PHOTO.value, state_data
+            )
+            kb = Keyboards.broadcast_keyboard()
+            await message.answer(
+                "✅ Текст сохранён.\n\n📸 Добавьте фото (опционально):", keyboard=kb
+            )
+
+        @bot.on.message(
+            PayloadRule({"action": "preview"}),
+            DBStateRule(self.db, UserState.BROADCAST_PHOTO.value),
+        )
+        async def broadcast_preview_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            state_data = self.db.get_state(message.from_id)[1]
+            text = state_data.get("text", "")
+            photo = state_data.get("photo")
+            kb = Keyboards.broadcast_preview_keyboard()
+            if photo:
+                await message.answer_photo(int(photo), text, keyboard=kb)
+            else:
+                await message.answer(text, keyboard=kb)
+            self.db.set_state(
+                message.from_id, UserState.BROADCAST_PREVIEW.value, state_data
+            )
+
+        @bot.on.message(
+            PayloadRule({"action": "add_photo"}),
+            DBStateRule(self.db, UserState.BROADCAST_PHOTO.value),
+        )
+        async def broadcast_add_photo_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            await message.answer(
+                "📸 Отправьте фото для рассылки:",
+                keyboard=Keyboards.broadcast_keyboard(),
+            )
+
+        @bot.on.message(DBStateRule(self.db, UserState.BROADCAST_PHOTO.value))
+        async def broadcast_photo_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            if message.attachments and any(att.photo for att in message.attachments):
+                photo_att = next(att for att in message.attachments if att.photo)
+                photo_url = photo_att.photo.sizes[-1].url
+                state_data = self.db.get_state(message.from_id)[1]
+                state_data["photo"] = photo_url
+                self.db.set_state(
+                    message.from_id, UserState.BROADCAST_PHOTO.value, state_data
+                )
+                kb = Keyboards.broadcast_keyboard()
+                await message.answer(
+                    "✅ Фото сохранено. Используйте кнопки:", keyboard=kb
+                )
+                return
+            await message.answer("❌ Отправьте фото или используйте кнопки.")
+
+        @bot.on.message(
+            PayloadRule({"action": "send_broadcast"}),
+            DBStateRule(self.db, UserState.BROADCAST_PREVIEW.value),
+        )
+        async def broadcast_send_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            state_data = self.db.get_state(message.from_id)[1]
+            text = state_data.get("text", "")
+            photo = state_data.get("photo")
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0")
+            users = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            sent = 0
+            for user_id in users:
+                try:
+                    if photo:
+                        await self.bot.api.messages.send(
+                            user_id=user_id,
+                            message=text,
+                            attachment=photo,
+                            random_id=int(time.time() * 1000),
+                        )
+                    else:
+                        await self.bot.api.messages.send(
+                            user_id=user_id,
+                            message=text,
+                            random_id=int(time.time() * 1000),
+                        )
+                    sent += 1
+                    await asyncio.sleep(0.34)  # Rate limit
+                except Exception as e:
+                    logging.error(f"Failed to send to {user_id}: {e}")
+            await message.answer(
+                f"✅ Рассылка отправлена {sent}/{len(users)} пользователям!"
+            )
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"action": "edit_broadcast"}))
+        async def broadcast_edit_handler(message: Message):
+            if message.from_id != Config.ADMIN_ID:
+                return
+            self.db.set_state(message.from_id, UserState.BROADCAST_TEXT.value, {})
+            kb = Keyboards.broadcast_keyboard()
+            await message.answer("✏️ Измените текст сообщения:", keyboard=kb)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_stats"}))
+        async def admin_stats_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            # Статистика пользователей
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
+            blocked_users = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE last_activity >= datetime('now', '-7 days')
+            """)
+            active_users = cursor.fetchone()[0]
+            # Статистика задач
+            cursor.execute("SELECT COUNT(*) FROM generation_tasks")
+            total_tasks = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM generation_tasks WHERE status = 'completed'"
+            )
+            completed_tasks = cursor.fetchone()[0]
+            # Статистика транзакций
+            cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions")
+            total_balance = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM transactions")
+            total_transactions = cursor.fetchone()[0]
+            # Статистика платежей
+            cursor.execute("SELECT COUNT(*) FROM payments WHERE status = 'confirmed'")
+            confirmed_payments = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount_rub), 0) FROM payments WHERE status = 'confirmed'"
+            )
+            total_revenue = cursor.fetchone()[0]
+            conn.close()
+
+            text = f"📊 Подробная статистика\n\n"
+            text += f"👥 Пользователи:\n"
+            text += f"   Всего: {total_users}\n"
+            text += f"   Активных (7 дн): {active_users}\n"
+            text += f"   Заблокировано: {blocked_users}\n\n"
+            text += f"📋 Задачи:\n"
+            text += f"   Всего: {total_tasks}\n"
+            text += f"   Выполнено: {completed_tasks}\n"
+            text += f"   В процессе: {total_tasks - completed_tasks}\n\n"
+            text += f"💰 Финансы:\n"
+            text += f"   Баланс (🍌): {total_balance}\n"
+            text += f"   Транзакции: {total_transactions}\n"
+            text += f"   Подтвержденных платежей: {confirmed_payments}\n"
+            text += f"   Доход (₽): {total_revenue}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_users"}))
+        async def admin_users_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users ORDER BY created_at DESC")
+            users = cursor.fetchall()
+            conn.close()
+            user_list = []
+            for user in users:
+                user_list.append(
+                    {
+                        "user_id": user[0],
+                        "balance": user[1],
+                        "created_at": user[2],
+                        "last_activity": user[3],
+                        "is_blocked": user[4],
+                        "block_reason": user[5],
+                    }
+                )
+            text = f"👥 Пользователи ({len(user_list)})\n\n"
+            for user in user_list[:10]:
+                status = (
+                    "🟢 Активен"
+                    if not user["is_blocked"]
+                    else f"🔴 Заблокирован: {user['block_reason']}"
+                )
+                text += f"👤 ID: {user['user_id']}\n"
+                text += f"💰 Баланс: {user['balance']} 🍌\n"
+                text += f"📅 Рег: {user['created_at']}\n"
+                text += f"⏰ Активность: {user['last_activity']}\n"
+                text += f"{status}\n\n"
+            if len(user_list) > 10:
+                text += f"📋 Всего: {len(user_list)} пользователей"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_tasks"}))
+        async def admin_tasks_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM generation_tasks ORDER BY created_at DESC LIMIT 20"
+            )
+            tasks = cursor.fetchall()
+            conn.close()
+            task_list = []
+            for task in tasks:
+                task_list.append(
+                    {
+                        "task_id": task[0],
+                        "user_id": task[1],
+                        "task_type": task[2],
+                        "model": task[3],
+                        "status": task[5],
+                        "cost": task[6],
+                        "created_at": task[7],
+                    }
+                )
+            text = f"📋 Задачи (последние 20)\n\n"
+            for task in task_list:
+                status_icon = {
+                    "completed": "✅",
+                    "processing": "⏳",
+                    "failed": "❌",
+                    "pending": "⌛",
+                }.get(task["status"], "❓")
+                text += (
+                    f"{status_icon} Задача #{task['task_id']} ({task['task_type']})\n"
+                )
+                text += f"👤 Пользователь: {task['user_id']}\n"
+                text += f"⚙️ Модель: {task['model']}\n"
+                text += f"💰 Стоимость: {task['cost']} 🍌\n"
+                text += f"📅 Дата: {task['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_transactions"}))
+        async def admin_transactions_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM transactions ORDER BY created_at DESC LIMIT 15"
+            )
+            transactions = cursor.fetchall()
+            conn.close()
+            trans_list = []
+            for trans in transactions:
+                trans_list.append(
+                    {
+                        "transaction_id": trans[0],
+                        "user_id": trans[1],
+                        "amount": trans[2],
+                        "reason": trans[3],
+                        "created_at": trans[4],
+                    }
+                )
+            text = f"💳 Транзакции (последние 15)\n\n"
+            for trans in trans_list:
+                sign = "➕" if trans["amount"] > 0 else "➖"
+                text += f"{sign} {abs(trans['amount'])} 🍌\n"
+                text += f"👤 Пользователь: {trans['user_id']}\n"
+                text += f"📝 Причина: {trans['reason']}\n"
+                text += f"📅 Дата: {trans['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_payments"}))
+        async def admin_payments_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT 10")
+            payments = cursor.fetchall()
+            conn.close()
+            pay_list = []
+            for pay in payments:
+                pay_list.append(
+                    {
+                        "id": pay[0],
+                        "user_id": pay[1],
+                        "amount_rub": pay[4],
+                        "status": pay[5],
+                        "created_at": pay[6],
+                    }
+                )
+            text = f"💵 Платежи (последние 10)\n\n"
+            for pay in pay_list:
+                status_icon = {"confirmed": "✅", "pending": "⏳", "failed": "❌"}.get(
+                    pay["status"], "❓"
+                )
+                text += f"{status_icon} {pay['amount_rub']} ₽\n"
+                text += f"👤 Пользователь: {pay['user_id']}\n"
+                text += f"🏷️ Статус: {pay['status']}\n"
+                text += f"📅 Дата: {pay['created_at']}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
+
+        @bot.on.message(PayloadRule({"cmd": "admin_stats"}))
+        async def admin_stats_handler(message: Message):
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            # Статистика пользователей
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
+            blocked_users = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE last_activity >= datetime('now', '-7 days')
+            """)
+            active_users = cursor.fetchone()[0]
+            # Статистика задач
+            cursor.execute("SELECT COUNT(*) FROM generation_tasks")
+            total_tasks = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM generation_tasks WHERE status = 'completed'"
+            )
+            completed_tasks = cursor.fetchone()[0]
+            # Статистика транзакций
+            cursor.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions")
+            total_balance = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM transactions")
+            total_transactions = cursor.fetchone()[0]
+            # Статистика платежей
+            cursor.execute("SELECT COUNT(*) FROM payments WHERE status = 'confirmed'")
+            confirmed_payments = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount_rub), 0) FROM payments WHERE status = 'confirmed'"
+            )
+            total_revenue = cursor.fetchone()[0]
+            conn.close()
+
+            text = f"📊 Подробная статистика\n\n"
+            text += f"👥 Пользователи:\n"
+            text += f"   Всего: {total_users}\n"
+            text += f"   Активных (7 дн): {active_users}\n"
+            text += f"   Заблокировано: {blocked_users}\n\n"
+            text += f"📋 Задачи:\n"
+            text += f"   Всего: {total_tasks}\n"
+            text += f"   Выполнено: {completed_tasks}\n"
+            text += f"   В процессе: {total_tasks - completed_tasks}\n\n"
+            text += f"💰 Финансы:\n"
+            text += f"   Баланс (🍌): {total_balance}\n"
+            text += f"   Транзакции: {total_transactions}\n"
+            text += f"   Подтвержденных платежей: {confirmed_payments}\n"
+            text += f"   Доход (₽): {total_revenue}\n\n"
+            await message.answer(text, keyboard=Keyboards.admin_menu())
+            self.db.clear_state(message.from_id)
 
         @bot.on.message(PayloadContainsRule("topup"), blocking=True)
         async def topup_package_handler(message: Message):
@@ -3305,6 +4110,9 @@ class BananaBoomBot:
             payment_id = payment["id"]
             status = data.get("Status", "").upper()
             self.db.update_payment_status(payment_id, status)
+            payment = self.db.get_payment_by_order_id(
+                order_id
+            )  # Reload to get updated status
 
             if status == "CONFIRMED" and payment.get("status") != "CONFIRMED":
                 amount_rub = payment["amount_rub"]
@@ -3423,7 +4231,7 @@ class BananaBoomBot:
         confirmation_response = await self.bot.api.request(
             "groups.getCallbackConfirmationCode", {"group_id": Config.VK_GROUP_ID}
         )
-        self.confirmation_code = confirmation_response["response"]
+        self.confirmation_code = confirmation_response["response"]["code"]
         self.secret_key = "qejrxidddnfmnvqosmhuapeidnfeygwr"  # from existing VK server
         print(f"✅ Confirmation: {self.confirmation_code}")
         print(f"🔑 Secret: {self.secret_key}")
@@ -3446,6 +4254,7 @@ class BananaBoomBot:
     async def run(self):
         print("🍌 Banana Boom Bot запущен на webhook!")
         await self.run_webhook_server()
+        # await self.run_admin_server()
 
 
 if __name__ == "__main__":
