@@ -2115,7 +2115,32 @@ class BananaBoomBot:
 
         self.confirmation_code = None
         self.secret_key = None
+        self._user_last_menu_msg = {}  # user_id → последнее меню
         self._setup_handlers()
+
+
+    async def _show_menu(self, message, text: str, keyboard):
+        """Показать меню: удаляем предыдущее (если есть), отправляем новое."""
+        user_id = message.from_id
+        peer_id = message.peer_id
+        last = self._user_last_menu_msg.get(user_id)
+
+        if last is not None and last.get("peer_id") == peer_id:
+            try:
+                await self.bot.api.messages.delete(
+                    message_ids=[last["message_id"]],
+                    delete_for_all=True,
+                    peer_id=peer_id
+                )
+            except Exception:
+                pass
+
+        sent = await message.answer(text, keyboard=keyboard)
+        if sent:
+            self._user_last_menu_msg[user_id] = {
+                "message_id": getattr(sent, "message_id", None),
+                "peer_id": peer_id,
+            }
 
     async def vk_handler(self, request):
         try:
@@ -2217,7 +2242,7 @@ class BananaBoomBot:
         async def create_video_handler(message: Message):
             user = self.db.get_or_create_user(message.from_id)
             text = "💰 Стоимость: от 14 🍌\n\nВведите промпт или выберите тип:"
-            await message.answer(text, keyboard=Keyboards.video_options())
+            await self._show_menu(message, text, keyboard=Keyboards.video_options())
             self.db.set_state(
                 message.from_id,
                 UserState.VIDEO_WAITING_PROMPT.value,
@@ -2285,7 +2310,7 @@ class BananaBoomBot:
                 payload_dict = {}
             if "input" in payload_dict and payload_dict["input"] == "text":
                 kb = Keyboards.regular_back("create_video")
-                await message.answer("💭 Введите промпт для видео:", keyboard=kb)
+                await self._show_menu(message, "💭 Введите промпт для видео:", keyboard=kb)
                 self.db.set_state(message.from_id, state, data)
                 return
 
@@ -2570,7 +2595,8 @@ class BananaBoomBot:
         @bot.on.message(PayloadRule({"cmd": "create_photo"}))
         async def create_photo_handler(message: Message):
             balance = self.db.get_balance(message.from_id)
-            await message.answer(
+            await self._show_menu(
+                message,
                 f"🖼 Создание фото\n\n🍌 Баланс: {balance} 🍌\n\nШаг 1: Загрузка референсов (опционально, до 14)\n\nПосле - 'Продолжить' или 'Пропустить'",
                 keyboard=Keyboards.photo_creation_step(),
             )
@@ -2601,7 +2627,7 @@ class BananaBoomBot:
                     if action == "continue_refs"
                     else "✅ Референсы пропущены.\n\nВыберите модель:"
                 )
-                await message.answer(msg, keyboard=kb)
+                await self._show_menu(message, msg, keyboard=kb)
                 self.db.set_state(
                     message.from_id, UserState.PHOTO_WAITING_MODEL.value, data
                 )
@@ -2726,7 +2752,7 @@ class BananaBoomBot:
         @bot.on.message(PayloadRule({"cmd": "photo_analysis"}))
         async def photo_analysis_handler(message: Message):
             text = f"📸 Фото→Промпт (бесплатно)\n\nОтправьте фото для анализа."
-            await message.answer(text, keyboard=Keyboards.regular_back("main_menu"))
+            await self._show_menu(message, text, keyboard=Keyboards.regular_back("main_menu"))
             self.db.set_state(
                 message.from_id, UserState.ANALYSIS_WAITING_PHOTO.value, {}
             )
